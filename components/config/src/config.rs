@@ -11,6 +11,9 @@ pub const DEFAULT_BITCOIND_RPC_THREADS: usize = 4;
 pub const DEFAULT_BITCOIND_RPC_TIMEOUT: u32 = 15;
 pub const DEFAULT_LRU_CACHE_SIZE: usize = 50_000;
 pub const DEFAULT_INDEXER_CHANNEL_CAPACITY: usize = 10;
+/// Number of blocks the indexer rolls back when its persisted tip is no longer canonical, and the
+/// maximum depth it will walk back looking for a common ancestor (INFRA-389).
+pub const DEFAULT_REORG_WINDOW: u64 = 100;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -95,6 +98,7 @@ pub struct ResourcesConfig {
     pub bitcoind_rpc_threads: usize,
     pub bitcoind_rpc_timeout: u32,
     pub indexer_channel_capacity: usize,
+    pub reorg_window: u64,
 }
 
 impl ResourcesConfig {
@@ -129,6 +133,7 @@ impl Config {
                 bitcoind_rpc_threads: DEFAULT_BITCOIND_RPC_THREADS,
                 bitcoind_rpc_timeout: DEFAULT_BITCOIND_RPC_TIMEOUT,
                 indexer_channel_capacity: DEFAULT_INDEXER_CHANNEL_CAPACITY,
+                reorg_window: DEFAULT_REORG_WINDOW,
             },
             bitcoind: BitcoindConfig {
                 rpc_url: "http://0.0.0.0:18443".into(),

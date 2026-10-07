@@ -33,6 +33,7 @@ use crate::{
 
 pub mod block_pool;
 pub mod pipeline;
+pub mod reconcile;
 pub mod types;
 pub mod utils;
 
@@ -72,8 +73,15 @@ pub struct Indexer {
 }
 
 /// Starts a Bitcoin block indexer pipeline.
+///
+/// `download_start_block_height` is where block download begins when the index is empty;
+/// `sequence_start_block_height` is where blocks start being sequenced and indexed. Blocks below the
+/// latter are only stored as compacted blocks. They differ for ordinals, whose satoshi numbering
+/// needs every ancestor block in the blocks DB (download from 0, sequence from the first
+/// inscription), and coincide for runes.
 pub async fn start_bitcoin_indexer(
     indexer: &mut Indexer,
+    download_start_block_height: u64,
     sequence_start_block_height: u64,
     stream_blocks_at_chain_tip: bool,
     compress_blocks: bool,
@@ -157,6 +165,7 @@ pub async fn start_bitcoin_indexer(
             &block_pool_arc,
             &http_client,
             bitcoind_chain_tip.index,
+            download_start_block_height,
             sequence_start_block_height,
             compress_blocks,
             abort_signal,
