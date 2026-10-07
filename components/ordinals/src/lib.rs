@@ -315,7 +315,8 @@ async fn new_ordinals_indexer_runloop(
         // No postgres DB means we might be using an archived blocks DB, make sure we index from the first inscription chain tip.
         (None, Some(y)) => {
             let x = BlockIdentifier {
-                index: first_inscription_height(config) - 1,
+                // saturating: testnet4's first inscription height is 0 (would wrap to u64::MAX).
+                index: first_inscription_height(config).saturating_sub(1),
                 hash: "0x0000000000000000000000000000000000000000000000000000000000000000".into(),
             };
             Some(if x.index <= y.index { x } else { y })
@@ -426,4 +427,44 @@ pub async fn start_ordinals_indexer(
         ctx,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lowest_missing_block_height;
+
+    fn scratch_db(name: &str) -> (rocksdb::DB, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        (rocksdb::DB::open(&opts, &path).unwrap(), path)
+    }
+
+    /// INFRA-385: a DB filled only from the first inscription (767430) upward lacks every ancestor.
+    #[test]
+    fn lowest_missing_block_height_on_db_holding_only_767430_and_above() {
+        let (db, path) = scratch_db("ord-lowest-missing-a");
+        for h in 767_430u32..767_440 {
+            db.put(h.to_be_bytes(), b"x").unwrap();
+        }
+        assert_eq!(lowest_missing_block_height(&db, 767_439, 767_429), Some(0));
+        drop(db);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn lowest_missing_block_height_finds_hole_and_accepts_complete_range() {
+        let (db, path) = scratch_db("ord-lowest-missing-b");
+        for h in (0u32..=10).filter(|h| *h != 7) {
+            db.put(h.to_be_bytes(), b"x").unwrap();
+        }
+        assert_eq!(lowest_missing_block_height(&db, 10, 10), Some(7));
+        // The hole is above complete_below, so it is not required.
+        assert_eq!(lowest_missing_block_height(&db, 10, 6), None);
+        // Empty DB (last_insert 0) is the caller's "start from zero".
+        assert_eq!(lowest_missing_block_height(&db, 0, 10), None);
+        drop(db);
+        let _ = std::fs::remove_dir_all(path);
+    }
 }
