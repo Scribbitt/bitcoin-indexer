@@ -66,6 +66,19 @@ pub fn bitcoind_get_chain_tip(config: &BitcoindConfig, ctx: &Context) -> BlockId
     }
 }
 
+/// Retrieves the canonical block hash (bare hex, no `0x` prefix) at `height`, in one attempt.
+pub fn bitcoind_get_block_hash(
+    config: &BitcoindConfig,
+    ctx: &Context,
+    height: u64,
+) -> Result<String, String> {
+    let bitcoin_rpc = bitcoind_get_client(config, ctx);
+    bitcoin_rpc
+        .get_block_hash(height)
+        .map(|hash| hash.to_string())
+        .map_err(|e| format!("bitcoind: unable to get block hash at #{height}: {e}"))
+}
+
 /// Retrieves the block_height for a given blockhash.
 pub fn bitcoind_get_block_height(
     bitcoin_rpc: &Client,

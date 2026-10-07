@@ -17,7 +17,7 @@ use std::{
 };
 
 use bitcoind::{
-    start_bitcoin_indexer, try_debug, try_error, try_info, try_warn,
+    reconcile::check_persisted_tip, start_bitcoin_indexer, try_debug, try_error, try_info, try_warn,
     types::BlockIdentifier,
     utils::{future_block_on, Context},
     Indexer, IndexerCommand,
@@ -58,6 +58,29 @@ fn pg_pools(config: &Config) -> PgConnectionPools {
     }
 }
 
+const ZERO_HASH: &str = "0x0000000000000000000000000000000000000000000000000000000000000000";
+
+/// Lowest height in `0..=min(last_insert, complete_below)` that has no entry in the blocks DB, or
+/// `None` if that whole range is present. Heights above `complete_below` are not required to be
+/// contiguous: only the ancestors of the first inscription must exist.
+fn lowest_missing_block_height(
+    blocks_db: &rocksdb::DB,
+    last_insert: u64,
+    complete_below: u64,
+) -> Option<u64> {
+    // An empty DB (no last_insert) is handled by the caller as "start from zero".
+    if last_insert == 0 {
+        return None;
+    }
+    let upper = last_insert.min(complete_below);
+    (0..=upper).find(|height| {
+        !matches!(
+            blocks_db.get_pinned((*height as u32).to_be_bytes()),
+            Ok(Some(_))
+        )
+    })
+}
+
 async fn new_ordinals_indexer_runloop(
     prometheus: &PrometheusMonitoring,
     abort_signal: &Arc<AtomicBool>,
@@ -77,6 +100,36 @@ async fn new_ordinals_indexer_runloop(
     let (commands_tx, commands_rx) =
         crossbeam_channel::bounded(config.resources.indexer_channel_capacity);
     let pg_pools = pg_pools(config);
+
+    // INFRA-389: reconcile the persisted tip against bitcoind before the indexer thread starts. A
+    // tip persisted on an orphaned branch is rolled back by a fixed window (Postgres keeps only the
+    // tip hash), and the canonical blocks inside the window are simply re-indexed.
+    {
+        let pg_tip = {
+            let ord_client = pg_pool_client(&pg_pools.ordinals).await?;
+            db::ordinals_pg::get_chain_tip(&ord_client).await?
+        };
+        if let Some(tip) = pg_tip {
+            if let Some(plan) =
+                check_persisted_tip(&tip, config.resources.reorg_window, &config.bitcoind, ctx)?
+            {
+                let blocks_db_rw = open_blocks_db_with_retry(true, config, ctx);
+                blocks::delete_blocks_in_block_range(
+                    plan.rollback_start as u32,
+                    plan.rollback_end as u32,
+                    &blocks_db_rw,
+                    ctx,
+                );
+                // Newest first, as a reorg rollback would.
+                for block_height in (plan.rollback_start..=plan.rollback_end).rev() {
+                    rollback_block(block_height, config, &pg_pools, ctx).await?;
+                }
+                blocks_db_rw
+                    .flush()
+                    .map_err(|e| format!("error dropping rollback blocks from rocksdb: {e}"))?;
+            }
+        }
+    }
 
     let config_moved = config.clone();
     let ctx_moved = ctx.clone();
@@ -226,14 +279,32 @@ async fn new_ordinals_indexer_runloop(
         // Use readwrite mode to create the rocksdb if it doesn't exist (first run).
         let blocks_db = open_blocks_db_with_retry(true, config, ctx);
         let height = find_last_block_inserted(&blocks_db);
-        // Blocks DB does not have the hash available.
-        if height > 0 {
-            Some(BlockIdentifier {
+        // INFRA-385: `last_insert` is not a contiguous tip. Satoshi numbering walks every ancestor
+        // block, so the blocks DB must hold every height from 0 up to the first inscription. If
+        // anything below is missing, resume the download from the lowest missing height (block 0
+        // for a DB that was only ever filled from the first inscription onward).
+        let complete_below = first_inscription_height(config).saturating_sub(1);
+        match lowest_missing_block_height(&blocks_db, height as u64, complete_below) {
+            Some(missing) => {
+                try_info!(
+                    ctx,
+                    "blocks DB incomplete (last insert #{height}), will backfill from #{missing}"
+                );
+                if missing == 0 {
+                    None
+                } else {
+                    Some(BlockIdentifier {
+                        index: missing - 1,
+                        hash: ZERO_HASH.into(),
+                    })
+                }
+            }
+            // Blocks DB does not have the hash available.
+            None if height > 0 => Some(BlockIdentifier {
                 index: height as u64,
-                hash: "0x0000000000000000000000000000000000000000000000000000000000000000".into(),
-            })
-        } else {
-            None
+                hash: ZERO_HASH.into(),
+            }),
+            None => None,
         }
     };
     let chain_tip = match (pg_chain_tip, blocks_chain_tip) {
@@ -342,8 +413,11 @@ pub async fn start_ordinals_indexer(
         }
     }
 
+    // Download from block 0 but sequence from the first inscription: satoshi numbering walks every
+    // ancestor block, so they must all be in the blocks DB (INFRA-385).
     start_bitcoin_indexer(
         &mut indexer,
+        0,
         first_inscription_height(config),
         stream_blocks_at_chain_tip,
         true,

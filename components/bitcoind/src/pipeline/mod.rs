@@ -13,9 +13,11 @@ use reqwest::Client;
 
 use crate::{
     block_pool::BlockPool,
+    reconcile::{check_parent_walk_bounds, is_unknown_hash},
     pipeline::{
         rpc::{
             download_and_parse_block_with_retry, pipeline::start_block_download_pipeline,
+            retrieve_block_hash_with_retry,
             standardize_bitcoin_block,
         },
         zmq::start_zeromq_pipeline,
@@ -28,6 +30,9 @@ use crate::{
 
 pub mod rpc;
 pub mod zmq;
+
+/// How many canonical headers, ending at the index tip, the block pool is primed with at startup.
+const PRIMED_HEADERS_COUNT: usize = 7;
 
 /// Commands that can be sent to the block processor.
 pub(crate) enum BlockProcessorCommand {
@@ -124,6 +129,7 @@ async fn advance_block_pool(
     let network = BitcoinNetwork::from_network(config.bitcoind.network);
     let mut block_ids = VecDeque::new();
     block_ids.push_front(block.block_identifier.clone());
+    let mut parent_walk_depth: u64 = 0;
 
     let block_pool_ref = block_pool.clone();
     let block_store_ref = block_store.clone();
@@ -199,6 +205,13 @@ async fn advance_block_pool(
             }
         };
         if !canonical {
+            // INFRA-389: bound the parent walk. A pool that knows no ancestor of this block can
+            // never connect it, and every parent held in memory is a full standardized block.
+            parent_walk_depth += 1;
+            {
+                let store_len = block_store_ref.lock().unwrap().len();
+                check_parent_walk_bounds(parent_walk_depth, store_len, config.resources.reorg_window)?;
+            }
             let parent_block = {
                 // Handle a behaviour specific to ZMQ usage in bitcoind.
                 // Considering a simple re-org:
@@ -246,24 +259,46 @@ async fn initialize_block_pool(
     config: &Config,
     ctx: &Context,
 ) -> Result<(), String> {
-    let last_block = download_and_parse_block_with_retry(
-        http_client,
-        index_chain_tip.get_hash_bytes_str(),
-        &config.bitcoind,
-        ctx,
-    )
-    .await?;
+    // INFRA-389: prime with the last N headers ending at the tip, not just the tip, so that an
+    // ordinary short reorg found after a restart still connects to a known ancestor.
+    let tip_hash = if is_unknown_hash(&index_chain_tip.hash) {
+        // The blocks DB does not keep hashes: ask the node for the canonical one.
+        retrieve_block_hash_with_retry(http_client, &index_chain_tip.index, &config.bitcoind, ctx)
+            .await?
+    } else {
+        index_chain_tip.get_hash_bytes_str().to_string()
+    };
+    let mut headers = Vec::with_capacity(PRIMED_HEADERS_COUNT);
+    let mut next_hash = tip_hash;
+    for _ in 0..PRIMED_HEADERS_COUNT {
+        let block = download_and_parse_block_with_retry(
+            http_client,
+            &next_hash,
+            &config.bitcoind,
+            ctx,
+        )
+        .await?;
+        let header = block.get_block_header();
+        let at_genesis = header.block_identifier.index == 0;
+        next_hash = header.parent_block_identifier.get_hash_bytes_str().to_string();
+        headers.push(header);
+        if at_genesis {
+            break;
+        }
+    }
     let block_pool_ref = block_pool.clone();
     let mut pool = block_pool_ref.lock().unwrap();
-    match pool.process_header(last_block.get_block_header(), ctx) {
-        Ok(_) => {
-            try_debug!(
-                ctx,
-                "Primed fork processor with last seen block hash {index_chain_tip}"
-            );
+    // Oldest first, so each header connects to the previous one.
+    for header in headers.into_iter().rev() {
+        let id = header.block_identifier.clone();
+        if let Err(e) = pool.process_header(header, ctx) {
+            return Err(format!("Unable to load last seen block {id}: {e}"));
         }
-        Err(e) => return Err(format!("Unable to load last seen block: {e}")),
     }
+    try_debug!(
+        ctx,
+        "Primed fork processor with the last {PRIMED_HEADERS_COUNT} blocks up to {index_chain_tip}"
+    );
     Ok(())
 }
 
@@ -357,6 +392,18 @@ pub(crate) async fn block_processor_runloop(
     }
 }
 
+/// First block to download. When the index is empty this is `download_start_block_height`, which
+/// is deliberately separate from the sequencing start height: runes start both at their activation
+/// height (SKRYBITDEV-301, no point scanning older blocks), while ordinals download from 0 and only
+/// sequence from the first inscription, because satoshi numbering walks every ancestor block
+/// (INFRA-385).
+fn first_block_to_download(
+    chain_tip: Option<&BlockIdentifier>,
+    download_start_block_height: u64,
+) -> u64 {
+    chain_tip.map_or(download_start_block_height, |ct| ct.index + 1)
+}
+
 /// Starts a bitcoind RPC block download pipeline that will send us all historical bitcoin blocks in a parallel fashion. We will
 /// then stream these blocks into our block pool so they can be fed into the configured [Indexer]. This will eventually bring the
 /// index chain tip to `target_block_height`.
@@ -366,6 +413,7 @@ pub(crate) async fn download_rpc_blocks(
     block_pool: &Arc<Mutex<BlockPool>>,
     http_client: &Client,
     target_block_height: u64,
+    download_start_block_height: u64,
     sequence_start_block_height: u64,
     compress_blocks: bool,
     abort_signal: &Arc<AtomicBool>,
@@ -376,12 +424,7 @@ pub(crate) async fn download_rpc_blocks(
         let block_pool_ref = block_pool.clone();
         let pool = block_pool_ref.lock().unwrap();
         let chain_tip = pool.canonical_chain_tip().or(indexer.chain_tip.as_ref());
-        // When the index is empty, start from the protocol activation height
-        // (sequence_start_block_height) rather than block 0. Otherwise sub-
-        // protocols like Runes (genesis 840000) waste hours scanning blocks
-        // that can't possibly contain protocol data.
-        let start_block =
-            chain_tip.map_or(sequence_start_block_height, |ct| ct.index + 1);
+        let start_block = first_block_to_download(chain_tip, download_start_block_height);
         BlockHeights::BlockRange(start_block, target_block_height)
             .get_sorted_entries()
             .map_err(|_e| "Block start / end block spec invalid".to_string())?
@@ -425,4 +468,36 @@ pub(crate) async fn stream_zmq_blocks(
         ctx,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tip(index: u64) -> BlockIdentifier {
+        BlockIdentifier {
+            index,
+            hash: format!("0x{:064x}", index),
+        }
+    }
+
+    /// Runes pass download_start == sequence_start (SKRYBITDEV-301): an empty index still starts at
+    /// the activation height rather than block 0.
+    #[test]
+    fn runes_empty_index_starts_at_activation_height() {
+        assert_eq!(first_block_to_download(None, 840_000), 840_000);
+    }
+
+    /// Ordinals pass download_start = 0 (INFRA-385): every ancestor block must be stored, even though
+    /// sequencing starts at the first inscription height.
+    #[test]
+    fn ordinals_empty_index_starts_at_genesis() {
+        assert_eq!(first_block_to_download(None, 0), 0);
+    }
+
+    #[test]
+    fn non_empty_index_resumes_after_tip() {
+        assert_eq!(first_block_to_download(Some(&tip(767_429)), 0), 767_430);
+        assert_eq!(first_block_to_download(Some(&tip(840_010)), 840_000), 840_011);
+    }
 }
