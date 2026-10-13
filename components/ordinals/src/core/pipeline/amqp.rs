@@ -21,7 +21,10 @@ static EXCHANGE_NAME: OnceCell<String> = OnceCell::const_new();
 /// Initialize the AMQP connection and declare the exchange.
 /// Called once at indexer startup. If AMQP_URL env var is set, it
 /// overrides the config file URL (allows SOPS secret injection).
-pub async fn init(url: &str, exchange: &str) -> Result<(), String> {
+///
+/// On success returns a credential-free description of the broker endpoint
+/// (host, port, vhost) suitable for logging.
+pub async fn init(url: &str, exchange: &str) -> Result<String, String> {
     let effective_url = std::env::var("AMQP_URL").unwrap_or_else(|_| url.to_string());
 
     // Parse amqp://user:pass@host:port
@@ -33,6 +36,8 @@ pub async fn init(url: &str, exchange: &str) -> Result<(), String> {
     let password = parsed.password().unwrap_or("");
 
     let args = OpenConnectionArguments::new(host, port, user, password);
+    // Never log the URL or `args`: both carry the password.
+    let endpoint = format!("host={host} port={port} vhost=/");
 
     let connection = Connection::open(&args)
         .await
@@ -58,7 +63,7 @@ pub async fn init(url: &str, exchange: &str) -> Result<(), String> {
         .set(channel)
         .map_err(|_| "AMQP channel already initialized".to_string())?;
 
-    Ok(())
+    Ok(endpoint)
 }
 
 /// Publish a block.indexed event. Silent no-op if AMQP not initialized.

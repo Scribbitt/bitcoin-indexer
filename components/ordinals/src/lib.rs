@@ -68,7 +68,7 @@ async fn new_ordinals_indexer_runloop(
     if let Some(ref amqp) = config.amqp {
         if amqp.enabled {
             match core::pipeline::amqp::init(&amqp.url, &amqp.exchange).await {
-                Ok(()) => try_info!(ctx, "AMQP connected to {}", amqp.url),
+                Ok(endpoint) => try_info!(ctx, "AMQP connected ({endpoint})"),
                 Err(e) => try_warn!(ctx, "AMQP init failed (non-fatal): {e}"),
             }
         }
