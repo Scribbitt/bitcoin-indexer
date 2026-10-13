@@ -11,6 +11,10 @@ use amqprs::{
 };
 use tokio::sync::OnceCell;
 
+/// The connection must outlive `init()`: dropping the last user-held
+/// `Connection` handle makes amqprs send a close to the broker, which also
+/// closes every channel opened on it. Keep it for the life of the process.
+static CONNECTION: OnceCell<Connection> = OnceCell::const_new();
 static CHANNEL: OnceCell<Channel> = OnceCell::const_new();
 static EXCHANGE_NAME: OnceCell<String> = OnceCell::const_new();
 
@@ -47,6 +51,9 @@ pub async fn init(url: &str, exchange: &str) -> Result<(), String> {
     EXCHANGE_NAME
         .set(exchange.to_string())
         .map_err(|_| "AMQP exchange name already set".to_string())?;
+    CONNECTION
+        .set(connection)
+        .map_err(|_| "AMQP connection already initialized".to_string())?;
     CHANNEL
         .set(channel)
         .map_err(|_| "AMQP channel already initialized".to_string())?;
