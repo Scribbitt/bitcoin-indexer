@@ -26,12 +26,24 @@ pub struct Config {
     pub amqp: Option<AmqpConfig>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AmqpConfig {
     pub enabled: bool,
     pub url: String,
     pub exchange: String,
     pub routing_key: String,
+}
+
+// The URL carries the broker password; keep it out of `{:?}` output.
+impl std::fmt::Debug for AmqpConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AmqpConfig")
+            .field("enabled", &self.enabled)
+            .field("url", &"<redacted>")
+            .field("exchange", &self.exchange)
+            .field("routing_key", &self.routing_key)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug)]
