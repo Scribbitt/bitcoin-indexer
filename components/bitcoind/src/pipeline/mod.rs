@@ -13,19 +13,19 @@ use reqwest::Client;
 
 use crate::{
     block_pool::BlockPool,
-    reconcile::{
-        check_parent_walk_bounds, is_off_best_chain, is_unknown_hash, needs_best_chain_check,
-    },
     pipeline::{
         rpc::{
             download_and_parse_block_with_retry, pipeline::start_block_download_pipeline,
-            retrieve_block_hash_with_retry,
-            standardize_bitcoin_block,
+            retrieve_best_chain_hash_with_retry, retrieve_block_hash_with_retry,
+            retrieve_block_header_with_retry, standardize_bitcoin_block,
         },
         zmq::start_zeromq_pipeline,
     },
+    reconcile::{
+        check_parent_walk_bounds, is_off_best_chain, is_unknown_hash, needs_best_chain_check,
+    },
     try_debug, try_info,
-    types::{BitcoinBlockData, BitcoinNetwork, BlockIdentifier, BlockchainEvent},
+    types::{BitcoinBlockData, BitcoinNetwork, BlockBytesCursor, BlockIdentifier, BlockchainEvent},
     utils::{AbstractBlock, BlockHeights, Context},
     Indexer, IndexerCommand,
 };
@@ -33,8 +33,8 @@ use crate::{
 pub mod rpc;
 pub mod zmq;
 
-/// How many canonical headers, ending at the index tip, the block pool is primed with at startup.
-const PRIMED_HEADERS_COUNT: usize = 7;
+#[cfg(test)]
+mod processor_tests;
 
 /// Commands that can be sent to the block processor.
 pub(crate) enum BlockProcessorCommand {
@@ -114,188 +114,374 @@ pub(crate) fn wait_for_thread_finish(
         .map_err(|e| format!("Failed to join thread: {:?}", e))
 }
 
-/// Moves our block pool with a newly received standardized block
-async fn advance_block_pool(
-    block: BitcoinBlockData,
-    block_pool: &Arc<Mutex<BlockPool>>,
-    block_store: &Arc<Mutex<HashMap<BlockIdentifier, BitcoinBlockData>>>,
-    http_client: &Client,
-    indexer_commands_tx: &Sender<IndexerCommand>,
-    abort_signal: &Arc<AtomicBool>,
-    config: &Config,
-    ctx: &Context,
+/// A block fetched from bitcoind, standardized, with its compacted bytes when the indexer keeps a
+/// blocks DB (ordinals).
+pub(crate) struct FetchedBlock {
+    pub block: BitcoinBlockData,
+    pub compacted: Option<Vec<u8>>,
+}
+
+/// What the block processor needs from bitcoind (INFRA-685). Production talks RPC; tests use maps,
+/// so they drive the same loop the indexer runs.
+pub(crate) trait ChainSource {
+    /// Downloads block `hash` (bare hex).
+    async fn fetch_block(&self, hash: &str) -> Result<FetchedBlock, String>;
+    /// Hash of bitcoind's best chain at `height`, or `None` when the height is above its tip.
+    async fn best_chain_hash(&self, height: u64) -> Result<Option<String>, String>;
+}
+
+/// Where the block processor sends indexer commands.
+pub(crate) trait IndexerSink {
+    fn send(&self, command: IndexerCommand) -> Result<(), String>;
+}
+
+struct RpcChainSource<'a> {
+    http_client: &'a Client,
+    network: BitcoinNetwork,
+    compress_blocks: bool,
+    config: &'a Config,
+    ctx: &'a Context,
+}
+
+impl ChainSource for RpcChainSource<'_> {
+    async fn fetch_block(&self, hash: &str) -> Result<FetchedBlock, String> {
+        let raw = download_and_parse_block_with_retry(
+            self.http_client,
+            hash,
+            &self.config.bitcoind,
+            self.ctx,
+        )
+        .await?;
+        let compacted = if self.compress_blocks {
+            Some(
+                BlockBytesCursor::from_full_block(&raw)
+                    .map_err(|e| format!("unable to compress block {hash}: {e}"))?,
+            )
+        } else {
+            None
+        };
+        let block = standardize_bitcoin_block(raw, &self.network, self.ctx).map_err(|(e, _)| e)?;
+        Ok(FetchedBlock { block, compacted })
+    }
+
+    async fn best_chain_hash(&self, height: u64) -> Result<Option<String>, String> {
+        retrieve_best_chain_hash_with_retry(
+            self.http_client,
+            height,
+            &self.config.bitcoind,
+            self.ctx,
+        )
+        .await
+    }
+}
+
+struct ChannelSink<'a> {
+    tx: &'a Sender<IndexerCommand>,
+    abort_signal: &'a Arc<AtomicBool>,
+    config: &'a Config,
+    ctx: &'a Context,
+}
+
+impl IndexerSink for ChannelSink<'_> {
+    fn send(&self, command: IndexerCommand) -> Result<(), String> {
+        send_indexer_command(self.tx, command, self.abort_signal, self.config, self.ctx)
+    }
+}
+
+/// The block processor's state and settings, shared by every message it handles.
+pub(crate) struct BlockProcessorState<'a, S: ChainSource, K: IndexerSink> {
+    pub block_pool: &'a Arc<Mutex<BlockPool>>,
+    pub block_store: &'a Arc<Mutex<HashMap<BlockIdentifier, BitcoinBlockData>>>,
+    pub source: &'a S,
+    pub sink: &'a K,
+    /// The indexer keeps a blocks DB (ordinals): every applied block must end up stored in it.
+    pub compress_blocks: bool,
+    pub reorg_window: u64,
+    pub ctx: &'a Context,
+}
+
+/// Handles one `ProcessBlocks` message: drops stale fork blocks, stores the compacted blocks that
+/// remain, then advances the block pool with each standardized block.
+pub(crate) async fn process_blocks_message<S: ChainSource, K: IndexerSink>(
+    compacted_blocks: Vec<(u64, Vec<u8>)>,
+    blocks: Vec<BitcoinBlockData>,
+    state: &BlockProcessorState<'_, S, K>,
 ) -> Result<(), String> {
-    if abort_signal.load(Ordering::SeqCst) {
-        return Ok(());
-    }
-    let network = BitcoinNetwork::from_network(config.bitcoind.network);
-    let mut block_ids = VecDeque::new();
-    block_ids.push_front(block.block_identifier.clone());
-    let mut parent_walk_depth: u64 = 0;
-
-    let block_pool_ref = block_pool.clone();
-    let block_store_ref = block_store.clone();
-
-    // Keep incoming block before sending.
-    {
-        let mut block_store_guard = block_store_ref.lock().unwrap();
-        block_store_guard.insert(block.block_identifier.clone(), block);
-    }
-
-    while let Some(block_id) = block_ids.pop_front() {
-        // INFRA-685: before anything else, check the block ZMQ (or the download pipeline) handed
-        // us. One at or below our tip that bitcoind's best chain does not contain is a stale fork
-        // behind us (testnet4 produces many). Walking its parents ends in the INFRA-389 bound and
-        // an exit once they are older than the headers the pool keeps; connecting it while its
-        // parent is still known would make it an equal-length fork the pool may switch to. Drop
-        // it. A block above our tip is not checked: a genuine reorg arrives that way and walks.
-        if parent_walk_depth == 0 {
-            let pool_tip = block_pool_ref.lock().unwrap().canonical_chain_tip().cloned();
-            if needs_best_chain_check(&block_id, pool_tip.as_ref()) {
-                let node_hash = retrieve_block_hash_with_retry(
-                    http_client,
-                    &block_id.index,
-                    &config.bitcoind,
-                    ctx,
-                )
-                .await?;
-                if is_off_best_chain(&block_id, &node_hash) {
-                    try_info!(
-                        ctx,
-                        "Ignoring stale fork block {} at or below the tip {}: bitcoind's best chain has 0x{} at that height",
-                        block_id,
-                        pool_tip.as_ref().map_or_else(String::new, |t| t.to_string()),
-                        node_hash.trim_start_matches("0x")
-                    );
-                    block_store_ref.lock().unwrap().remove(&block_id);
-                    continue;
-                }
+    // INFRA-685: decide about stale fork blocks BEFORE storing compacted blocks, so a dropped
+    // block's bytes never overwrite the canonical block at its height in the blocks DB.
+    let pool_tip = state
+        .block_pool
+        .lock()
+        .unwrap()
+        .canonical_chain_tip()
+        .cloned();
+    let mut dropped_heights = vec![];
+    let mut kept = Vec::with_capacity(blocks.len());
+    for block in blocks.into_iter() {
+        let id = &block.block_identifier;
+        if needs_best_chain_check(id, pool_tip.as_ref()) {
+            let node_hash = state.source.best_chain_hash(id.index).await?;
+            if is_off_best_chain(id, node_hash.as_deref()) {
+                try_info!(
+                    state.ctx,
+                    "Ignoring stale fork block {} at or below the tip {}: bitcoind's best chain has {} at that height",
+                    id,
+                    pool_tip.as_ref().map_or_else(String::new, |t| t.to_string()),
+                    node_hash.as_deref().unwrap_or("no block")
+                );
+                dropped_heights.push(id.index);
+                continue;
             }
         }
-        let (header, canonical) = {
-            let mut pool_guard = block_pool_ref.lock().unwrap();
-            let mut block_store_guard = block_store_ref.lock().unwrap();
-            let block = block_store_guard.get(&block_id).unwrap();
-            let header = block.get_header();
-            if pool_guard.can_process_header(&header) {
-                match pool_guard.process_header(header.clone(), ctx)? {
-                    Some(event) => match event {
-                        BlockchainEvent::BlockchainUpdatedWithHeaders(event) => {
-                            let mut apply_blocks = vec![];
-                            for header in event.new_headers.iter() {
-                                apply_blocks.push(
-                                    block_store_guard.remove(&header.block_identifier).unwrap(),
-                                );
-                            }
-                            send_indexer_command(
-                                indexer_commands_tx,
-                                IndexerCommand::IndexBlocks {
-                                    apply_blocks,
-                                    rollback_block_ids: vec![],
-                                },
-                                abort_signal,
-                                config,
-                                ctx,
-                            )?;
-                            (header, true)
-                        }
-                        BlockchainEvent::BlockchainUpdatedWithReorg(event) => {
-                            let mut apply_blocks = vec![];
-                            for header in event.headers_to_apply.iter() {
-                                apply_blocks.push(
-                                    block_store_guard.remove(&header.block_identifier).unwrap(),
-                                );
-                            }
-                            let rollback_block_ids: Vec<BlockIdentifier> = event
-                                .headers_to_rollback
-                                .iter()
-                                .map(|h| h.block_identifier.clone())
-                                .collect();
-                            send_indexer_command(
-                                indexer_commands_tx,
-                                IndexerCommand::IndexBlocks {
-                                    apply_blocks,
-                                    rollback_block_ids,
-                                },
-                                abort_signal,
-                                config,
-                                ctx,
-                            )?;
-                            (header, true)
-                        }
-                    },
-                    None => {
-                        // INFRA-685: the header was recorded but the canonical chain did not
-                        // change, e.g. a parent fetched by the walk below lands on a side branch
-                        // that is not longer yet. Its child, processed next, switches the chain.
-                        // This used to be a fatal "Unable to append block", so every reorg deeper
-                        // than one block (and a stale fork whose parent the pool still holds)
-                        // exited. The block stays in the store: a later reorg applies it from there.
-                        try_debug!(
-                            ctx,
-                            "Block {} recorded, canonical chain unchanged",
-                            header.block_identifier
-                        );
-                        (header, true)
-                    }
-                }
+        kept.push(block);
+    }
+    let compacted_blocks: Vec<(u64, Vec<u8>)> = compacted_blocks
+        .into_iter()
+        .filter(|(height, _)| !dropped_heights.contains(height))
+        .collect();
+    if !compacted_blocks.is_empty() {
+        state
+            .sink
+            .send(IndexerCommand::StoreCompactedBlocks(compacted_blocks))?;
+    }
+    for block in kept.into_iter() {
+        advance_block_pool(block, state).await?;
+    }
+    Ok(())
+}
+
+/// Moves our block pool with a newly received standardized block. Blocks the pool cannot connect
+/// are walked parent by parent (bounded by INFRA-389) until they do.
+pub(crate) async fn advance_block_pool<S: ChainSource, K: IndexerSink>(
+    block: BitcoinBlockData,
+    state: &BlockProcessorState<'_, S, K>,
+) -> Result<(), String> {
+    let ctx = state.ctx;
+    let original = block.block_identifier.clone();
+    let mut block_ids = VecDeque::new();
+    block_ids.push_front(original.clone());
+    let mut parent_walk_depth: u64 = 0;
+    // Compacted bytes of the parents downloaded by the walk, for the blocks DB (INFRA-685).
+    let mut walked_compacted: HashMap<BlockIdentifier, Vec<u8>> = HashMap::new();
+
+    {
+        let pool = state.block_pool.lock().unwrap();
+        if pool.contains_header(&original) {
+            try_info!(
+                ctx,
+                "Block {original} already processed, ignoring the repeat"
+            );
+            return Ok(());
+        }
+    }
+    // Keep incoming block before sending.
+    state
+        .block_store
+        .lock()
+        .unwrap()
+        .insert(original.clone(), block);
+
+    while let Some(block_id) = block_ids.pop_front() {
+        let header = {
+            let store = state.block_store.lock().unwrap();
+            store
+                .get(&block_id)
+                .ok_or_else(|| format!("block {block_id} missing from the block store"))?
+                .get_header()
+        };
+        // `None`: the pool cannot connect the header. `Some(None)`: recorded, canonical chain
+        // unchanged. `Some(Some(event))`: the canonical chain moved.
+        let outcome = {
+            let mut pool = state.block_pool.lock().unwrap();
+            if pool.can_process_header(&header) {
+                Some(pool.process_header(header.clone(), ctx)?)
             } else {
+                None
+            }
+        };
+        match outcome {
+            Some(Some(event)) => {
+                apply_chain_event(event, &original, &mut walked_compacted, state).await?;
+            }
+            Some(None) if block_id != original => {
+                // INFRA-685: a parent fetched by the walk lands on a side branch that is not
+                // longer yet; its child, processed next, switches the chain. This used to be a
+                // fatal "Unable to append block", so every reorg deeper than one block exited.
+                // The block stays in the store: the reorg that follows applies it from there.
+                try_debug!(
+                    ctx,
+                    "Block {} recorded on a side branch, canonical chain unchanged",
+                    header.block_identifier
+                );
+            }
+            Some(None) => {
+                // The announced block itself did not move the chain although bitcoind follows
+                // it (a stale block was dropped before getting here): bitcoind switched to a
+                // branch the pool does not rank above ours, e.g. a shorter one with more work.
+                // Exit so the restart reconciles the index against bitcoind (INFRA-389).
+                state.block_store.lock().unwrap().remove(&block_id);
+                return Err(format!(
+                    "Unable to append block {block_id}: bitcoind follows it but the block pool does not rank its branch above the current tip"
+                ));
+            }
+            None => {
                 try_info!(
                     ctx,
                     "Received non-canonical block {}",
                     header.block_identifier
                 );
-                (header, false)
-            }
-        };
-        if !canonical {
-            // INFRA-389: bound the parent walk. A pool that knows no ancestor of this block can
-            // never connect it, and every parent held in memory is a full standardized block.
-            parent_walk_depth += 1;
-            {
-                let store_len = block_store_ref.lock().unwrap().len();
-                check_parent_walk_bounds(parent_walk_depth, store_len, config.resources.reorg_window)?;
-            }
-            let parent_block = {
-                // Handle a behaviour specific to ZMQ usage in bitcoind.
-                // Considering a simple re-org:
+                // INFRA-389: bound the parent walk. A pool that knows no ancestor of this block
+                // can never connect it, and every parent held in memory is a full block.
+                parent_walk_depth += 1;
+                {
+                    let store_len = state.block_store.lock().unwrap().len();
+                    check_parent_walk_bounds(parent_walk_depth, store_len, state.reorg_window)?;
+                }
+                // ZMQ announces only the new tip of a reorg:
                 // A (1) - B1 (2) - C1 (3)
                 //       \ B2 (4) - C2 (5) - D2 (6)
-                // When D2 is being discovered (making A -> B2 -> C2 -> D2 the new canonical fork)
-                // it looks like ZMQ is only publishing D2.
-                // Without additional operation, we end up with a block that we can't append.
-                let parent_block_hash = header
+                // D2 arrives alone; its parents are fetched until one connects.
+                let parent_hash = header
                     .parent_block_identifier
                     .get_hash_bytes_str()
                     .to_string();
-                // try_info!(
-                //     ctx,
-                //     "zmq: Re-org detected, retrieving parent block {parent_block_hash}"
-                // );
-                let parent_block = download_and_parse_block_with_retry(
-                    http_client,
-                    &parent_block_hash,
-                    &config.bitcoind,
-                    ctx,
-                )
-                .await?;
-                standardize_bitcoin_block(parent_block, &network, ctx).map_err(|(e, _)| e)?
-            };
-            // Keep parent block and repeat the cycle
-            {
-                let mut block_store_guard = block_store_ref.lock().unwrap();
-                block_store_guard
-                    .insert(parent_block.block_identifier.clone(), parent_block.clone());
+                let fetched = state.source.fetch_block(&parent_hash).await?;
+                let parent_id = fetched.block.block_identifier.clone();
+                if let Some(bytes) = fetched.compacted {
+                    walked_compacted.insert(parent_id.clone(), bytes);
+                }
+                state
+                    .block_store
+                    .lock()
+                    .unwrap()
+                    .insert(parent_id.clone(), fetched.block);
+                block_ids.push_front(block_id);
+                block_ids.push_front(parent_id);
             }
-            block_ids.push_front(block_id);
-            block_ids.push_front(parent_block.block_identifier.clone());
         }
     }
     Ok(())
 }
 
-/// Initialize our block pool with the current index's last seen block, so we can detect any re-orgs or gaps that may come our
-/// way with the next blocks.
+/// Takes the blocks of `ids` out of the block store, downloading any that is missing (a block
+/// applied, rolled back and applied again, A->B->A, was already removed: INFRA-685), together
+/// with their compacted bytes when `with_compacted` holds (from the walk, or downloaded).
+async fn collect_blocks<S: ChainSource, K: IndexerSink>(
+    ids: &[BlockIdentifier],
+    with_compacted: impl Fn(&BlockIdentifier) -> bool,
+    walked_compacted: &mut HashMap<BlockIdentifier, Vec<u8>>,
+    state: &BlockProcessorState<'_, S, K>,
+) -> Result<(Vec<BitcoinBlockData>, Vec<(u64, Vec<u8>)>), String> {
+    let mut blocks = Vec::with_capacity(ids.len());
+    let mut compacted = vec![];
+    for id in ids.iter() {
+        let stored = state.block_store.lock().unwrap().remove(id);
+        let needs_bytes = with_compacted(id);
+        let walked_bytes = if needs_bytes {
+            walked_compacted.remove(id)
+        } else {
+            None
+        };
+        let (block, bytes) = match (stored, walked_bytes) {
+            (Some(block), Some(bytes)) => (block, Some(bytes)),
+            (Some(block), None) if !needs_bytes => (block, None),
+            (stored, _) => {
+                let fetched = state.source.fetch_block(id.get_hash_bytes_str()).await?;
+                if fetched.block.block_identifier != *id {
+                    return Err(format!(
+                        "bitcoind returned {} for {}",
+                        fetched.block.block_identifier, id
+                    ));
+                }
+                (stored.unwrap_or(fetched.block), fetched.compacted)
+            }
+        };
+        if needs_bytes {
+            let bytes = bytes.ok_or_else(|| format!("no compacted bytes for block {id}"))?;
+            compacted.push((id.index, bytes));
+        }
+        blocks.push(block);
+    }
+    Ok((blocks, compacted))
+}
+
+/// Sends the indexer what a chain event asks for.
+///
+/// INFRA-685, for indexers with a blocks DB (ordinals): every applied block must be in the blocks
+/// DB before it is indexed. The announced block's bytes were stored by `process_blocks_message`,
+/// but parents fetched by the walk were not, and a reorg's rollback deletes the blocks DB entry at
+/// each rolled-back height, which is the same height as an applied block. So a reorg goes out as:
+/// rollback only, then the compacted bytes of every applied block, then the apply. Without that,
+/// heights stayed missing and a later sat traversal failed with "block #N not in database".
+async fn apply_chain_event<S: ChainSource, K: IndexerSink>(
+    event: BlockchainEvent,
+    original: &BlockIdentifier,
+    walked_compacted: &mut HashMap<BlockIdentifier, Vec<u8>>,
+    state: &BlockProcessorState<'_, S, K>,
+) -> Result<(), String> {
+    let compress = state.compress_blocks;
+    match event {
+        BlockchainEvent::BlockchainUpdatedWithHeaders(event) => {
+            let ids: Vec<BlockIdentifier> = event
+                .new_headers
+                .iter()
+                .map(|h| h.block_identifier.clone())
+                .collect();
+            // The announced block's bytes are already stored; any other applied block came from
+            // the walk (or an earlier side branch).
+            let (apply_blocks, compacted) = collect_blocks(
+                &ids,
+                |id| compress && id != original,
+                walked_compacted,
+                state,
+            )
+            .await?;
+            if !compacted.is_empty() {
+                state
+                    .sink
+                    .send(IndexerCommand::StoreCompactedBlocks(compacted))?;
+            }
+            state.sink.send(IndexerCommand::IndexBlocks {
+                apply_blocks,
+                rollback_block_ids: vec![],
+            })
+        }
+        BlockchainEvent::BlockchainUpdatedWithReorg(event) => {
+            let ids: Vec<BlockIdentifier> = event
+                .headers_to_apply
+                .iter()
+                .map(|h| h.block_identifier.clone())
+                .collect();
+            let rollback_block_ids: Vec<BlockIdentifier> = event
+                .headers_to_rollback
+                .iter()
+                .map(|h| h.block_identifier.clone())
+                .collect();
+            let (apply_blocks, compacted) =
+                collect_blocks(&ids, |_| compress, walked_compacted, state).await?;
+            if !compress {
+                return state.sink.send(IndexerCommand::IndexBlocks {
+                    apply_blocks,
+                    rollback_block_ids,
+                });
+            }
+            state.sink.send(IndexerCommand::IndexBlocks {
+                apply_blocks: vec![],
+                rollback_block_ids,
+            })?;
+            state
+                .sink
+                .send(IndexerCommand::StoreCompactedBlocks(compacted))?;
+            state.sink.send(IndexerCommand::IndexBlocks {
+                apply_blocks,
+                rollback_block_ids: vec![],
+            })
+        }
+    }
+}
+
+/// Initialize our block pool with the current index's last seen blocks, so we can detect any
+/// re-orgs or gaps that may come our way with the next blocks.
 async fn initialize_block_pool(
     block_pool: &Arc<Mutex<BlockPool>>,
     index_chain_tip: &BlockIdentifier,
@@ -303,8 +489,10 @@ async fn initialize_block_pool(
     config: &Config,
     ctx: &Context,
 ) -> Result<(), String> {
-    // INFRA-389: prime with the last N headers ending at the tip, not just the tip, so that an
-    // ordinary short reorg found after a restart still connects to a known ancestor.
+    // INFRA-389: prime with the last headers ending at the tip, not just the tip, so that a reorg
+    // found after a restart still connects to a known ancestor. INFRA-685: as many as the pool
+    // keeps (the reorg window), fetched as headers only.
+    let primed_count = block_pool.lock().unwrap().retained_headers();
     let tip_hash = if is_unknown_hash(&index_chain_tip.hash) {
         // The blocks DB does not keep hashes: ask the node for the canonical one.
         retrieve_block_hash_with_retry(http_client, &index_chain_tip.index, &config.bitcoind, ctx)
@@ -312,19 +500,17 @@ async fn initialize_block_pool(
     } else {
         index_chain_tip.get_hash_bytes_str().to_string()
     };
-    let mut headers = Vec::with_capacity(PRIMED_HEADERS_COUNT);
+    let mut headers = Vec::with_capacity(primed_count);
     let mut next_hash = tip_hash;
-    for _ in 0..PRIMED_HEADERS_COUNT {
-        let block = download_and_parse_block_with_retry(
-            http_client,
-            &next_hash,
-            &config.bitcoind,
-            ctx,
-        )
-        .await?;
-        let header = block.get_block_header();
+    for _ in 0..primed_count {
+        let header =
+            retrieve_block_header_with_retry(http_client, &next_hash, &config.bitcoind, ctx)
+                .await?;
         let at_genesis = header.block_identifier.index == 0;
-        next_hash = header.parent_block_identifier.get_hash_bytes_str().to_string();
+        next_hash = header
+            .parent_block_identifier
+            .get_hash_bytes_str()
+            .to_string();
         headers.push(header);
         if at_genesis {
             break;
@@ -341,7 +527,7 @@ async fn initialize_block_pool(
     }
     try_debug!(
         ctx,
-        "Primed fork processor with the last {PRIMED_HEADERS_COUNT} blocks up to {index_chain_tip}"
+        "Primed fork processor with the last {primed_count} blocks up to {index_chain_tip}"
     );
     Ok(())
 }
@@ -356,6 +542,7 @@ pub(crate) async fn block_processor_runloop(
     block_store: &Arc<Mutex<HashMap<BlockIdentifier, BitcoinBlockData>>>,
     http_client: &Client,
     sequence_start_block_height: u64,
+    compress_blocks: bool,
     abort_signal: &Arc<AtomicBool>,
     config: &Config,
     ctx: &Context,
@@ -366,6 +553,28 @@ pub(crate) async fn block_processor_runloop(
             initialize_block_pool(block_pool, index_chain_tip, http_client, config, ctx).await?;
         }
     }
+    let source = RpcChainSource {
+        http_client,
+        network: BitcoinNetwork::from_network(config.bitcoind.network),
+        compress_blocks,
+        config,
+        ctx,
+    };
+    let sink = ChannelSink {
+        tx: indexer_commands_tx,
+        abort_signal,
+        config,
+        ctx,
+    };
+    let state = BlockProcessorState {
+        block_pool,
+        block_store,
+        source: &source,
+        sink: &sink,
+        compress_blocks,
+        reorg_window: config.resources.reorg_window,
+        ctx,
+    };
 
     loop {
         if abort_signal.load(Ordering::SeqCst) {
@@ -382,17 +591,11 @@ pub(crate) async fn block_processor_runloop(
                 error_message,
             }) => {
                 // SKRYBITDEV-586: forward to indexer which persists to `failed_blocks` table.
-                send_indexer_command(
-                    indexer_commands_tx,
-                    IndexerCommand::RecordFailedBlock {
-                        block_height,
-                        error_kind,
-                        error_message,
-                    },
-                    abort_signal,
-                    config,
-                    ctx,
-                )?;
+                sink.send(IndexerCommand::RecordFailedBlock {
+                    block_height,
+                    error_kind,
+                    error_message,
+                })?;
                 continue;
             }
             Ok(BlockProcessorCommand::Flush { ack_tx }) => {
@@ -407,32 +610,10 @@ pub(crate) async fn block_processor_runloop(
             }
             Err(e) => return Err(format!("block ingestion runloop error: {e}")),
         };
-
-        if !compacted_blocks.is_empty() {
-            send_indexer_command(
-                indexer_commands_tx,
-                IndexerCommand::StoreCompactedBlocks(compacted_blocks),
-                abort_signal,
-                config,
-                ctx,
-            )?;
+        if abort_signal.load(Ordering::SeqCst) {
+            return Ok(());
         }
-        for block in blocks.into_iter() {
-            if abort_signal.load(Ordering::SeqCst) {
-                return Ok(());
-            }
-            advance_block_pool(
-                block,
-                block_pool,
-                block_store,
-                http_client,
-                indexer_commands_tx,
-                abort_signal,
-                config,
-                ctx,
-            )
-            .await?;
-        }
+        process_blocks_message(compacted_blocks, blocks, &state).await?;
     }
 }
 
@@ -542,6 +723,9 @@ mod tests {
     #[test]
     fn non_empty_index_resumes_after_tip() {
         assert_eq!(first_block_to_download(Some(&tip(767_429)), 0), 767_430);
-        assert_eq!(first_block_to_download(Some(&tip(840_010)), 840_000), 840_011);
+        assert_eq!(
+            first_block_to_download(Some(&tip(840_010)), 840_000),
+            840_011
+        );
     }
 }

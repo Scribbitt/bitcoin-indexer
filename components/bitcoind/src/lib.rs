@@ -93,7 +93,10 @@ pub async fn start_bitcoin_indexer(
     let http_client = build_http_client();
 
     // Block pool that will track the canonical chain and detect any reorgs that may happen.
-    let block_pool_arc = Arc::new(Mutex::new(BlockPool::new()));
+    // INFRA-685: it remembers enough headers to follow a reorg as deep as the reorg window.
+    let block_pool_arc = Arc::new(Mutex::new(BlockPool::for_reorg_window(
+        config.resources.reorg_window,
+    )));
     let block_pool = block_pool_arc.clone();
     // Block cache that will keep block data in memory while it is prepared to be sent to indexers.
     let block_store_arc = Arc::new(Mutex::new(HashMap::new()));
@@ -128,6 +131,7 @@ pub async fn start_bitcoin_indexer(
                     &block_store_moved,
                     &http_client_moved,
                     sequence_start_block_height,
+                    compress_blocks,
                     &abort_signal_moved,
                     &config_moved,
                     &ctx_moved,
