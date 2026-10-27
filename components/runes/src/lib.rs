@@ -7,7 +7,7 @@ use std::{
 };
 
 use bitcoind::{
-    start_bitcoin_indexer, try_error, try_info, try_warn,
+    reconcile::check_persisted_tip, start_bitcoin_indexer, try_error, try_info, try_warn,
     types::BlockIdentifier,
     utils::{future_block_on, Context},
     Indexer, IndexerCommand,
@@ -37,6 +37,21 @@ async fn new_runes_indexer_runloop(
     config: &Config,
     ctx: &Context,
 ) -> Result<Indexer, String> {
+    // INFRA-389: reconcile the persisted tip against bitcoind before the indexer thread (and its
+    // caches) start, so a tip left on an orphaned branch is rolled back instead of walked from.
+    {
+        let mut pg_client = pg_pool_client(pg_pool).await?;
+        if let Some(tip) = db::get_chain_tip(&pg_client).await {
+            if let Some(plan) =
+                check_persisted_tip(&tip, config.resources.reorg_window, &config.bitcoind, ctx)?
+            {
+                for block_height in (plan.rollback_start..=plan.rollback_end).rev() {
+                    roll_back_block(&mut pg_client, block_height, ctx).await;
+                }
+            }
+        }
+    }
+
     let (commands_tx, commands_rx) =
         crossbeam_channel::bounded(config.resources.indexer_channel_capacity);
 
@@ -242,9 +257,12 @@ pub async fn start_runes_indexer(
             .await?;
     }
 
+    // Runes download and sequence from the same height (SKRYBITDEV-301).
+    let rune_genesis = get_rune_genesis_block_height(config.bitcoind.network);
     start_bitcoin_indexer(
         &mut indexer,
-        get_rune_genesis_block_height(config.bitcoind.network),
+        rune_genesis,
+        rune_genesis,
         stream_blocks_at_chain_tip,
         false,
         abort_signal,

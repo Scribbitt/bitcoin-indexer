@@ -33,30 +33,6 @@ pub(crate) struct BitcoinBlockFullBreakdown {
     pub confirmations: i32,
 }
 
-impl BitcoinBlockFullBreakdown {
-    pub fn get_block_header(&self) -> BlockHeader {
-        // Block id
-        let hash = format!("0x{}", self.hash);
-        let block_identifier = BlockIdentifier {
-            index: self.height as u64,
-            hash,
-        };
-        // Parent block id
-        let parent_block_hash = match self.previousblockhash {
-            Some(ref value) => format!("0x{}", value),
-            None => format!("0x{}", BlockHash::all_zeros()),
-        };
-        let parent_block_identifier = BlockIdentifier {
-            index: (self.height - 1) as u64,
-            hash: parent_block_hash,
-        };
-        BlockHeader {
-            block_identifier,
-            parent_block_identifier,
-        }
-    }
-}
-
 #[derive(Clone, PartialEq, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BitcoinTransactionFullBreakdown {
@@ -189,6 +165,146 @@ pub(crate) async fn download_and_parse_block_with_retry(
         }
     };
     Ok(block)
+}
+
+/// RPC error code bitcoind returns for `getblockhash` above its tip ("Block height out of range").
+pub(crate) const RPC_INVALID_PARAMETER: i32 = -8;
+
+/// One JSON-RPC call. The outer error is transport or parsing; the inner one is bitcoind's own
+/// error object, so a caller can act on its code.
+async fn rpc_call<T: serde::de::DeserializeOwned>(
+    http_client: &HttpClient,
+    bitcoin_config: &BitcoindConfig,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<Result<T, RpcError>, String> {
+    let body = json!({
+        "jsonrpc": "1.0",
+        "id": "chainhook-cli",
+        "method": method,
+        "params": params
+    });
+    let response = http_client
+        .post(&bitcoin_config.rpc_url)
+        .basic_auth(
+            &bitcoin_config.rpc_username,
+            Some(&bitcoin_config.rpc_password),
+        )
+        .header("Content-Type", "application/json")
+        .header("Host", &bitcoin_config.rpc_url[7..])
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("unable to send request ({})", e))?
+        .json::<bitcoincore_rpc::jsonrpc::Response>()
+        .await
+        .map_err(|e| format!("unable to parse response ({})", e))?;
+    if let Some(e) = response.error {
+        return Ok(Err(e));
+    }
+    response
+        .result::<T>()
+        .map(Ok)
+        .map_err(|e| format!("unable to parse response ({})", e))
+}
+
+async fn with_retry<T, F, Fut>(what: &str, ctx: &Context, mut attempt: F) -> Result<T, String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let max_retries = 10;
+    let mut errors_count = 0;
+    loop {
+        match attempt().await {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                errors_count += 1;
+                if errors_count >= max_retries {
+                    return Err(format!(
+                        "unable to retrieve {what} after {errors_count} attempts. Error: {e}"
+                    ));
+                }
+                if errors_count > 3 {
+                    ctx.try_log(|logger| {
+                        slog::warn!(
+                            logger,
+                            "unable to retrieve {what}: will retry in a few seconds (attempt #{errors_count}). Error: {e}",
+                        )
+                    });
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+}
+
+/// INFRA-685: the hash of bitcoind's best chain at `block_height` (bare hex), or `None` when the
+/// height is above the node's tip (RPC -8). A block at a height the node does not have is not on
+/// its best chain; retrying that for ~20 s and exiting turned a node that stepped back (testnet4
+/// switching to a shorter chain with more work) into a crash loop.
+pub(crate) async fn retrieve_best_chain_hash_with_retry(
+    http_client: &HttpClient,
+    block_height: u64,
+    bitcoin_config: &BitcoindConfig,
+    ctx: &Context,
+) -> Result<Option<String>, String> {
+    with_retry(&format!("block hash #{block_height}"), ctx, || async {
+        match rpc_call::<String>(
+            http_client,
+            bitcoin_config,
+            "getblockhash",
+            json!([block_height]),
+        )
+        .await?
+        {
+            Ok(hash) => Ok(Some(hash)),
+            Err(e) if e.code == RPC_INVALID_PARAMETER => Ok(None),
+            Err(e) => Err(format!("rpc error {}: {}", e.code, e.message)),
+        }
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct RpcBlockHeader {
+    hash: String,
+    height: u64,
+    previousblockhash: Option<String>,
+}
+
+/// The header of block `block_hash` via `getblockheader`: much cheaper than downloading the block
+/// when only the chain links are needed (priming the block pool, INFRA-685).
+pub(crate) async fn retrieve_block_header_with_retry(
+    http_client: &HttpClient,
+    block_hash: &str,
+    bitcoin_config: &BitcoindConfig,
+    ctx: &Context,
+) -> Result<BlockHeader, String> {
+    let header = with_retry(&format!("block header {block_hash}"), ctx, || async {
+        rpc_call::<RpcBlockHeader>(
+            http_client,
+            bitcoin_config,
+            "getblockheader",
+            json!([block_hash, true]),
+        )
+        .await?
+        .map_err(|e| format!("rpc error {}: {}", e.code, e.message))
+    })
+    .await?;
+    let parent_hash = header
+        .previousblockhash
+        .unwrap_or_else(|| BlockHash::all_zeros().to_string());
+    Ok(BlockHeader {
+        block_identifier: BlockIdentifier {
+            index: header.height,
+            hash: format!("0x{}", header.hash),
+        },
+        parent_block_identifier: BlockIdentifier {
+            index: header.height.saturating_sub(1),
+            hash: format!("0x{}", parent_hash),
+        },
+    })
 }
 
 pub(crate) async fn retrieve_block_hash_with_retry(

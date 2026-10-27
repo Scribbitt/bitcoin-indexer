@@ -9,7 +9,8 @@ use crate::{
     AmqpConfig, BitcoindConfig, Config, MetricsConfig, OrdinalsBrc20Config, OrdinalsConfig,
     OrdinalsMetaProtocolsConfig, PgDatabaseConfig, ResourcesConfig, RunesConfig, StorageConfig,
     DEFAULT_BITCOIND_RPC_THREADS, DEFAULT_BITCOIND_RPC_TIMEOUT, DEFAULT_INDEXER_CHANNEL_CAPACITY,
-    DEFAULT_LRU_CACHE_SIZE, DEFAULT_MEMORY_AVAILABLE, DEFAULT_ULIMIT, DEFAULT_WORKING_DIR,
+    DEFAULT_LRU_CACHE_SIZE, DEFAULT_MEMORY_AVAILABLE, DEFAULT_REORG_WINDOW, DEFAULT_ULIMIT,
+    DEFAULT_WORKING_DIR,
 };
 
 #[derive(Deserialize, Clone, Debug)]
@@ -74,6 +75,7 @@ pub struct ResourcesConfigToml {
     pub bitcoind_rpc_threads: Option<usize>,
     pub bitcoind_rpc_timeout: Option<u32>,
     pub indexer_channel_capacity: Option<usize>,
+    pub reorg_window: Option<u64>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -208,6 +210,7 @@ impl ConfigToml {
                     .resources
                     .indexer_channel_capacity
                     .unwrap_or(DEFAULT_INDEXER_CHANNEL_CAPACITY),
+                reorg_window: toml.resources.reorg_window.unwrap_or(DEFAULT_REORG_WINDOW),
             },
             bitcoind: BitcoindConfig {
                 rpc_url: toml.bitcoind.rpc_url.to_string(),

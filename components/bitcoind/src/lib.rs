@@ -33,6 +33,7 @@ use crate::{
 
 pub mod block_pool;
 pub mod pipeline;
+pub mod reconcile;
 pub mod types;
 pub mod utils;
 
@@ -72,8 +73,15 @@ pub struct Indexer {
 }
 
 /// Starts a Bitcoin block indexer pipeline.
+///
+/// `download_start_block_height` is where block download begins when the index is empty;
+/// `sequence_start_block_height` is where blocks start being sequenced and indexed. Blocks below the
+/// latter are only stored as compacted blocks. They differ for ordinals, whose satoshi numbering
+/// needs every ancestor block in the blocks DB (download from 0, sequence from the first
+/// inscription), and coincide for runes.
 pub async fn start_bitcoin_indexer(
     indexer: &mut Indexer,
+    download_start_block_height: u64,
     sequence_start_block_height: u64,
     stream_blocks_at_chain_tip: bool,
     compress_blocks: bool,
@@ -85,7 +93,10 @@ pub async fn start_bitcoin_indexer(
     let http_client = build_http_client();
 
     // Block pool that will track the canonical chain and detect any reorgs that may happen.
-    let block_pool_arc = Arc::new(Mutex::new(BlockPool::new()));
+    // INFRA-685: it remembers enough headers to follow a reorg as deep as the reorg window.
+    let block_pool_arc = Arc::new(Mutex::new(BlockPool::for_reorg_window(
+        config.resources.reorg_window,
+    )));
     let block_pool = block_pool_arc.clone();
     // Block cache that will keep block data in memory while it is prepared to be sent to indexers.
     let block_store_arc = Arc::new(Mutex::new(HashMap::new()));
@@ -120,6 +131,7 @@ pub async fn start_bitcoin_indexer(
                     &block_store_moved,
                     &http_client_moved,
                     sequence_start_block_height,
+                    compress_blocks,
                     &abort_signal_moved,
                     &config_moved,
                     &ctx_moved,
@@ -157,6 +169,7 @@ pub async fn start_bitcoin_indexer(
             &block_pool_arc,
             &http_client,
             bitcoind_chain_tip.index,
+            download_start_block_height,
             sequence_start_block_height,
             compress_blocks,
             abort_signal,
