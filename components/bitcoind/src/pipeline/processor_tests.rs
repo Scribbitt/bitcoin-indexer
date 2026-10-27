@@ -118,6 +118,9 @@ struct RecordingSink {
     blocks_db: RefCell<BTreeMap<u64, Vec<u8>>>,
     /// The indexer keeps a blocks DB (ordinals), so applied blocks must be in it.
     models_blocks_db: bool,
+    /// Model of `metadata::last_insert`: the last height stored, or the height below the last
+    /// rolled-back one. The ordinals restart resumes from the lower of this and the Postgres tip.
+    last_insert: Cell<u64>,
 }
 
 impl IndexerSink for RecordingSink {
@@ -126,7 +129,10 @@ impl IndexerSink for RecordingSink {
             IndexerCommand::StoreCompactedBlocks(blocks) => {
                 let mut db = self.blocks_db.borrow_mut();
                 let heights = blocks.iter().map(|(h, _)| *h).collect();
-                for (h, bytes) in blocks {
+                let mut sorted_blocks = blocks;
+                sorted_blocks.sort_by_key(|(h, _)| *h);
+                for (h, bytes) in sorted_blocks {
+                    self.last_insert.set(h);
                     db.insert(h, bytes);
                 }
                 self.commands.borrow_mut().push(Cmd::Store(heights));
@@ -138,6 +144,7 @@ impl IndexerSink for RecordingSink {
                 let mut db = self.blocks_db.borrow_mut();
                 for id in rollback_block_ids.iter() {
                     db.remove(&id.index);
+                    self.last_insert.set(id.index - 1);
                 }
                 // The indexer reads each applied block from the blocks DB (sat traversal).
                 for b in apply_blocks.iter() {
@@ -203,6 +210,7 @@ impl Env {
             for h in low..=tip {
                 db.insert(h, bytes_of(&id(0, h)));
             }
+            sink.last_insert.set(tip);
         }
         Env {
             pool: Arc::new(Mutex::new(pool)),
@@ -262,6 +270,12 @@ impl Env {
 
     fn store_len(&self) -> usize {
         self.store.lock().unwrap().len()
+    }
+
+    /// The blocks DB tip is the highest block stored (a restart must not resume below the Postgres
+    /// tip, which would index a block twice).
+    fn assert_last_insert(&self, height: u64) {
+        assert_eq!(self.sink.last_insert.get(), height, "blocks DB last_insert");
     }
 
     /// The blocks DB holds exactly `branch_of(h)`'s block at every height in `lo..=hi`.
@@ -331,6 +345,7 @@ fn reorg_deeper_than_seven_blocks_is_followed() {
     );
     // No hole in the blocks DB (review blocker 1).
     env.assert_blocks_db(157_700, 157_799, |h| if h > 157_780 { 1 } else { 0 });
+    env.assert_last_insert(157_799);
     assert_eq!(env.store_len(), 0, "nothing left in the block store");
 }
 
@@ -469,7 +484,9 @@ fn walked_parent_is_stored_in_the_blocks_db() {
         env.commands(),
         vec![
             Cmd::Store(vec![1_002]),
-            Cmd::Store(vec![1_001]),
+            // The announced block is stored again after its parent: the blocks DB tip must end
+            // at the highest height, not at the parent's.
+            Cmd::Store(vec![1_001, 1_002]),
             Cmd::Index {
                 apply: vec![id(0, 1_001)],
                 rollback: vec![]
@@ -481,6 +498,7 @@ fn walked_parent_is_stored_in_the_blocks_db() {
         ]
     );
     env.assert_blocks_db(990, 1_002, |_| 0);
+    env.assert_last_insert(1_002);
 }
 
 /// A -> B -> A: a block applied, rolled back and applied again is no longer in the block store.

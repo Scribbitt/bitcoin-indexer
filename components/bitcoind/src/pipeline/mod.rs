@@ -405,6 +405,49 @@ async fn collect_blocks<S: ChainSource, K: IndexerSink>(
     Ok((blocks, compacted))
 }
 
+/// The blocks DB tip (`metadata::last_insert`) is the last height stored, and the announced block
+/// was stored before its parents (`process_blocks_message`). Storing only parents would move the
+/// tip back below the block about to be indexed, and a restart then resumes from there and indexes
+/// that block twice (its count tables are additive). So whenever parents are stored, the announced
+/// block is stored again after them. It is downloaded once per walk, and only when ZMQ skipped
+/// blocks or a reorg was followed.
+async fn append_announced_block_bytes<S: ChainSource, K: IndexerSink>(
+    compacted: &mut Vec<(u64, Vec<u8>)>,
+    original: &BlockIdentifier,
+    walked_compacted: &mut HashMap<BlockIdentifier, Vec<u8>>,
+    state: &BlockProcessorState<'_, S, K>,
+) -> Result<(), String> {
+    if compacted.is_empty()
+        || compacted
+            .iter()
+            .any(|(height, _)| *height == original.index)
+    {
+        return Ok(());
+    }
+    let bytes = match walked_compacted.get(original) {
+        Some(bytes) => bytes.clone(),
+        None => {
+            let fetched = state
+                .source
+                .fetch_block(original.get_hash_bytes_str())
+                .await?;
+            if fetched.block.block_identifier != *original {
+                return Err(format!(
+                    "bitcoind returned {} for {}",
+                    fetched.block.block_identifier, original
+                ));
+            }
+            let bytes = fetched
+                .compacted
+                .ok_or_else(|| format!("no compacted bytes for block {original}"))?;
+            walked_compacted.insert(original.clone(), bytes.clone());
+            bytes
+        }
+    };
+    compacted.push((original.index, bytes));
+    Ok(())
+}
+
 /// Sends the indexer what a chain event asks for.
 ///
 /// INFRA-685, for indexers with a blocks DB (ordinals): every applied block must be in the blocks
@@ -429,13 +472,14 @@ async fn apply_chain_event<S: ChainSource, K: IndexerSink>(
                 .collect();
             // The announced block's bytes are already stored; any other applied block came from
             // the walk (or an earlier side branch).
-            let (apply_blocks, compacted) = collect_blocks(
+            let (apply_blocks, mut compacted) = collect_blocks(
                 &ids,
                 |id| compress && id != original,
                 walked_compacted,
                 state,
             )
             .await?;
+            append_announced_block_bytes(&mut compacted, original, walked_compacted, state).await?;
             if !compacted.is_empty() {
                 state
                     .sink
@@ -459,6 +503,8 @@ async fn apply_chain_event<S: ChainSource, K: IndexerSink>(
                 .collect();
             let (apply_blocks, compacted) =
                 collect_blocks(&ids, |_| compress, walked_compacted, state).await?;
+            let mut compacted = compacted;
+            append_announced_block_bytes(&mut compacted, original, walked_compacted, state).await?;
             if !compress {
                 return state.sink.send(IndexerCommand::IndexBlocks {
                     apply_blocks,
