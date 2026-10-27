@@ -18,8 +18,9 @@ use crate::{
 pub struct TipReconciliation {
     /// The persisted (non-canonical) tip.
     pub old_tip: BlockIdentifier,
-    /// The canonical block at the old tip's height.
-    pub canonical_at_old_tip: BlockIdentifier,
+    /// The canonical block at the old tip's height; `None` when bitcoind's best chain is shorter
+    /// than the old tip (INFRA-685).
+    pub canonical_at_old_tip: Option<BlockIdentifier>,
     /// First height to roll back (inclusive).
     pub rollback_start: u64,
     /// Last height to roll back (inclusive), i.e. the old tip's height.
@@ -42,32 +43,41 @@ pub fn is_unknown_hash(hash: &str) -> bool {
 }
 
 /// Decides whether `tip` is still canonical. `canonical_hash` returns the node's block hash at a
-/// height (with or without `0x`). Returns `None` when the tip is canonical, otherwise the rollback
-/// to apply: everything in `(tip.index - window, tip.index]`.
+/// height (with or without `0x`), or `None` when the height is above the node's tip. Returns `None`
+/// when the tip is canonical, otherwise the rollback to apply: everything in
+/// `(tip.index - window, tip.index]`.
 pub fn plan_tip_reconciliation<F>(
     tip: &BlockIdentifier,
     reorg_window: u64,
     canonical_hash: F,
 ) -> Result<Option<TipReconciliation>, String>
 where
-    F: Fn(u64) -> Result<String, String>,
+    F: Fn(u64) -> Result<Option<String>, String>,
 {
     if is_unknown_hash(&tip.hash) {
         // Nothing to compare against (e.g. a tip derived from the blocks DB).
         return Ok(None);
     }
+    // INFRA-685: a node whose best chain ends below the tip (RPC -8) does not have the tip on
+    // it either; that used to be an error at every start, i.e. a crash loop.
     let canonical_at_tip = canonical_hash(tip.index)?;
-    if strip_0x(&canonical_at_tip).eq_ignore_ascii_case(strip_0x(&tip.hash)) {
-        return Ok(None);
+    if let Some(hash) = &canonical_at_tip {
+        if strip_0x(hash).eq_ignore_ascii_case(strip_0x(&tip.hash)) {
+            return Ok(None);
+        }
     }
     let rollback_to = tip.index.saturating_sub(reorg_window.max(1));
-    let new_tip_hash = canonical_hash(rollback_to)?;
+    let new_tip_hash = canonical_hash(rollback_to)?.ok_or_else(|| {
+        format!(
+            "bitcoind has no block at #{rollback_to}: its best chain ends more than {reorg_window} blocks below the index tip {tip}"
+        )
+    })?;
     Ok(Some(TipReconciliation {
         old_tip: tip.clone(),
-        canonical_at_old_tip: BlockIdentifier {
+        canonical_at_old_tip: canonical_at_tip.map(|hash| BlockIdentifier {
             index: tip.index,
-            hash: with_0x(&canonical_at_tip),
-        },
+            hash: with_0x(&hash),
+        }),
         rollback_start: rollback_to + 1,
         rollback_end: tip.index,
         new_tip: BlockIdentifier {
@@ -93,7 +103,10 @@ pub fn check_persisted_tip(
             ctx,
             "persisted tip {} not canonical (canonical {}); rolling back to {}",
             plan.old_tip,
-            plan.canonical_at_old_tip,
+            plan.canonical_at_old_tip.as_ref().map_or_else(
+                || "none: bitcoind's chain is shorter".to_string(),
+                |b| b.to_string()
+            ),
             plan.new_tip.index
         );
     }
@@ -123,6 +136,28 @@ pub fn check_parent_walk_bounds(
         ));
     }
     Ok(())
+}
+
+/// INFRA-685: a block handed to the block processor at or below the pool tip may be a stale fork
+/// behind us (testnet4 produces many 1-2 block ones). When its parents are older than the headers
+/// the pool keeps, walking them can never connect and ends in the INFRA-389 bound; when its parent
+/// is still known it becomes an equal-length fork the pool may switch to. Such a block is only
+/// worth processing if bitcoind's best chain contains it: ask the node first.
+///
+/// A block above the pool tip is never checked: that is how a genuine reorg to a longer chain
+/// arrives (ZMQ announces only the new tip), and it must still walk to the common ancestor.
+pub fn needs_best_chain_check(block: &BlockIdentifier, pool_tip: Option<&BlockIdentifier>) -> bool {
+    pool_tip.is_some_and(|tip| block.index <= tip.index)
+}
+
+/// INFRA-685: true when bitcoind's best chain does not hold `block`: it has a different block at
+/// that height, or (`None`, RPC -8) its best chain ends below it. `node_hash_at_height` may carry a
+/// `0x` prefix or not.
+pub fn is_off_best_chain(block: &BlockIdentifier, node_hash_at_height: Option<&str>) -> bool {
+    match node_hash_at_height {
+        Some(hash) => !strip_0x(hash).eq_ignore_ascii_case(strip_0x(&block.hash)),
+        None => true,
+    }
 }
 
 #[cfg(test)]
@@ -164,14 +199,18 @@ mod tests {
         }
         let stale_tip = id(1, 154_545);
         let plan = plan_tip_reconciliation(&stale_tip, 100, |h| {
-            canonical.get(&h).cloned().ok_or("missing".to_string())
+            canonical
+                .get(&h)
+                .cloned()
+                .map(Some)
+                .ok_or("missing".to_string())
         })
         .unwrap()
         .expect("stale tip must be reconciled");
         assert_eq!(plan.rollback_start, 154_446);
         assert_eq!(plan.rollback_end, 154_545);
         assert_eq!(plan.new_tip, id(0, 154_445));
-        assert_eq!(plan.canonical_at_old_tip, id(0, 154_545));
+        assert_eq!(plan.canonical_at_old_tip, Some(id(0, 154_545)));
 
         // Prime the pool with the last 7 canonical headers ending at the new tip, then connect.
         let ctx = Context::empty();
@@ -209,9 +248,48 @@ mod tests {
     }
 
     #[test]
+    fn best_chain_check_only_at_or_below_the_tip() {
+        let tip = id(0, 100);
+        assert!(needs_best_chain_check(&id(1, 100), Some(&tip)));
+        assert!(needs_best_chain_check(&id(1, 40), Some(&tip)));
+        assert!(!needs_best_chain_check(&id(1, 101), Some(&tip)));
+        assert!(!needs_best_chain_check(&id(1, 40), None));
+        assert!(!is_off_best_chain(&id(0, 40), Some(&hash(0, 40))));
+        assert!(!is_off_best_chain(
+            &id(0, 40),
+            Some(&format!("0x{}", hash(0, 40).to_uppercase()))
+        ));
+        assert!(is_off_best_chain(&id(1, 40), Some(&hash(0, 40))));
+        assert!(is_off_best_chain(&id(1, 40), None), "above the node's tip");
+    }
+
+    /// INFRA-685: bitcoind's best chain ends below the persisted tip (RPC -8 at the tip's
+    /// height, e.g. testnet4 switched to a shorter chain with more work). That is a stale tip to
+    /// roll back, not an error at every start.
+    #[test]
+    fn tip_above_the_node_chain_is_rolled_back() {
+        let tip = id(1, 1_000);
+        let plan = plan_tip_reconciliation(&tip, 100, |h| Ok((h <= 998).then(|| hash(0, h))))
+            .unwrap()
+            .expect("a tip the node does not have must be reconciled");
+        assert_eq!(plan.canonical_at_old_tip, None);
+        assert_eq!(plan.new_tip, id(0, 900));
+        assert_eq!((plan.rollback_start, plan.rollback_end), (901, 1_000));
+    }
+
+    /// A node more than a window behind the tip cannot give a rollback target: say so.
+    #[test]
+    fn node_further_behind_than_the_window_is_an_error() {
+        let tip = id(0, 1_000);
+        let err =
+            plan_tip_reconciliation(&tip, 100, |h| Ok((h <= 800).then(|| hash(0, h)))).unwrap_err();
+        assert!(err.contains("more than 100 blocks below"), "{err}");
+    }
+
+    #[test]
     fn canonical_tip_is_left_alone() {
         let tip = id(0, 1000);
-        let plan = plan_tip_reconciliation(&tip, 100, |h| Ok(hash(0, h))).unwrap();
+        let plan = plan_tip_reconciliation(&tip, 100, |h| Ok(Some(hash(0, h)))).unwrap();
         assert!(plan.is_none());
     }
 
@@ -229,7 +307,7 @@ mod tests {
     #[test]
     fn window_larger_than_height_rolls_back_to_genesis() {
         let tip = id(1, 50);
-        let plan = plan_tip_reconciliation(&tip, 100, |h| Ok(hash(0, h)))
+        let plan = plan_tip_reconciliation(&tip, 100, |h| Ok(Some(hash(0, h))))
             .unwrap()
             .unwrap();
         assert_eq!(plan.rollback_start, 1);

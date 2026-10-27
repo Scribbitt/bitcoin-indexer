@@ -67,16 +67,24 @@ pub fn bitcoind_get_chain_tip(config: &BitcoindConfig, ctx: &Context) -> BlockId
 }
 
 /// Retrieves the canonical block hash (bare hex, no `0x` prefix) at `height`, in one attempt.
+/// `Ok(None)` when the height is above the node's tip (RPC -8, "Block height out of range").
 pub fn bitcoind_get_block_hash(
     config: &BitcoindConfig,
     ctx: &Context,
     height: u64,
-) -> Result<String, String> {
+) -> Result<Option<String>, String> {
     let bitcoin_rpc = bitcoind_get_client(config, ctx);
-    bitcoin_rpc
-        .get_block_hash(height)
-        .map(|hash| hash.to_string())
-        .map_err(|e| format!("bitcoind: unable to get block hash at #{height}: {e}"))
+    match bitcoin_rpc.get_block_hash(height) {
+        Ok(hash) => Ok(Some(hash.to_string())),
+        Err(bitcoincore_rpc::Error::JsonRpc(bitcoincore_rpc::jsonrpc::error::Error::Rpc(e)))
+            if e.code == -8 =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(format!(
+            "bitcoind: unable to get block hash at #{height}: {e}"
+        )),
+    }
 }
 
 /// Retrieves the block_height for a given blockhash.

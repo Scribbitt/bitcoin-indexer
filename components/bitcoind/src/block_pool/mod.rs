@@ -19,7 +19,12 @@ pub struct BlockPool {
     orphans: BTreeSet<BlockIdentifier>,
     forks: BTreeMap<usize, ChainSegment>,
     headers_store: BTreeMap<BlockIdentifier, BlockHeader>,
+    /// Length of the canonical segment at which its oldest headers count as confirmed and are
+    /// pruned. A reorg can only connect if its fork point is still in memory, so this bounds the
+    /// deepest reorg the pool can follow (INFRA-685).
+    confirmed_segment_length: usize,
 }
+/// Historical default: a block beyond the 6th ancestor counts as confirmed.
 pub const CONFIRMED_SEGMENT_MINIMUM_LENGTH: i32 = 7;
 impl Default for BlockPool {
     fn default() -> Self {
@@ -29,6 +34,18 @@ impl Default for BlockPool {
 
 impl BlockPool {
     pub fn new() -> BlockPool {
+        Self::with_confirmed_segment_length(CONFIRMED_SEGMENT_MINIMUM_LENGTH as usize)
+    }
+
+    /// INFRA-685: a pool that keeps enough headers to follow a reorg of `reorg_window` blocks.
+    /// With the default seven headers, any reorg deeper than about six blocks could never find
+    /// its fork point, so the parent walk ran into the INFRA-389 bound and the process exited.
+    pub fn for_reorg_window(reorg_window: u64) -> BlockPool {
+        let length = (reorg_window as usize).saturating_add(2);
+        Self::with_confirmed_segment_length(length.max(CONFIRMED_SEGMENT_MINIMUM_LENGTH as usize))
+    }
+
+    pub fn with_confirmed_segment_length(confirmed_segment_length: usize) -> BlockPool {
         let mut forks = BTreeMap::new();
         forks.insert(0, ChainSegment::new());
         let headers_store = BTreeMap::new();
@@ -37,7 +54,19 @@ impl BlockPool {
             orphans: BTreeSet::new(),
             forks,
             headers_store,
+            confirmed_segment_length: confirmed_segment_length
+                .max(CONFIRMED_SEGMENT_MINIMUM_LENGTH as usize),
         }
+    }
+
+    /// How many headers, ending at the tip, the pool keeps after pruning.
+    pub fn retained_headers(&self) -> usize {
+        self.confirmed_segment_length - 1
+    }
+
+    /// True if the pool already holds this header (a repeated announcement).
+    pub fn contains_header(&self, block_identifier: &BlockIdentifier) -> bool {
+        self.headers_store.contains_key(block_identifier)
     }
 
     pub fn canonical_chain_tip(&self) -> Option<&BlockIdentifier> {
@@ -100,7 +129,9 @@ impl BlockPool {
             let (block_appended, mut new_fork) = fork.try_append_block(&header, ctx);
             if block_appended {
                 if let Some(new_fork) = new_fork.take() {
-                    let fork_id = self.forks.len();
+                    // INFRA-685: `forks.len()` collides with a live id once a lower fork was
+                    // pruned, and the insert below would then overwrite that fork.
+                    let fork_id = self.forks.keys().next_back().map_or(0, |id| id + 1);
                     self.forks.insert(fork_id, new_fork);
                     fork_updated = self.forks.get_mut(&fork_id);
                 } else {
@@ -242,11 +273,12 @@ impl BlockPool {
             }
             segment
         };
-        if canonical_segment.len() < CONFIRMED_SEGMENT_MINIMUM_LENGTH as usize {
+        let length = self.confirmed_segment_length;
+        if canonical_segment.len() < length {
             return;
         }
-        // Any block beyond 6th ancestor is considered as confirmed and can be pruned
-        let cut_off = &canonical_segment[(CONFIRMED_SEGMENT_MINIMUM_LENGTH - 2) as usize];
+        // Any block beyond the (length - 1)th ancestor is considered as confirmed and can be pruned
+        let cut_off = &canonical_segment[length - 2];
 
         // Prune forks using the confirmed block
         let mut blocks_to_prune = vec![];
@@ -271,10 +303,10 @@ impl BlockPool {
             slog::debug!(
                 logger,
                 "Removing {} confirmed blocks from block store.",
-                canonical_segment[6..].len()
+                canonical_segment[length - 1..].len()
             )
         });
-        for confirmed_block in canonical_segment[6..].iter() {
+        for confirmed_block in canonical_segment[length - 1..].iter() {
             let block = match self.headers_store.remove(confirmed_block) {
                 None => {
                     ctx.try_log(|logger| {
