@@ -125,6 +125,24 @@ pub fn check_parent_walk_bounds(
     Ok(())
 }
 
+/// INFRA-685: a block handed to the block processor at or below the pool tip may be a stale fork
+/// behind us (testnet4 produces many 1-2 block ones). When its parents are older than the headers
+/// the pool keeps, walking them can never connect and ends in the INFRA-389 bound; when its parent
+/// is still known it becomes an equal-length fork the pool may switch to. Such a block is only
+/// worth processing if bitcoind's best chain contains it: ask the node first.
+///
+/// A block above the pool tip is never checked: that is how a genuine reorg to a longer chain
+/// arrives (ZMQ announces only the new tip), and it must still walk to the common ancestor.
+pub fn needs_best_chain_check(block: &BlockIdentifier, pool_tip: Option<&BlockIdentifier>) -> bool {
+    pool_tip.is_some_and(|tip| block.index <= tip.index)
+}
+
+/// INFRA-685: true when bitcoind's best chain holds a different block at `block`'s height, i.e. the
+/// node itself does not follow `block`. `node_hash_at_height` may carry a `0x` prefix or not.
+pub fn is_off_best_chain(block: &BlockIdentifier, node_hash_at_height: &str) -> bool {
+    !strip_0x(node_hash_at_height).eq_ignore_ascii_case(strip_0x(&block.hash))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -206,6 +224,308 @@ mod tests {
         };
         assert!(err.contains("no common ancestor"));
         assert!(depth <= 101 && store_len <= 102, "memory stays bounded");
+    }
+
+    /// Header on `branch` at `height` whose parent is on branch 0 when `height - 1 <= fork_at`,
+    /// i.e. branch `branch` forks off branch 0 right after `fork_at`.
+    fn fork_header(branch: u8, height: u64, fork_at: u64) -> BlockHeader {
+        let parent_branch = if height - 1 <= fork_at { 0 } else { branch };
+        BlockHeader {
+            block_identifier: id(branch, height),
+            parent_block_identifier: id(parent_branch, height - 1),
+        }
+    }
+
+    /// Pool primed the way `initialize_block_pool` does: the last 7 canonical headers up to `tip`.
+    fn primed_pool(tip: u64, ctx: &Context) -> BlockPool {
+        let mut pool = BlockPool::new();
+        for h in (tip - 6)..=tip {
+            pool.process_header(header(0, h), ctx).unwrap();
+        }
+        pool
+    }
+
+    #[derive(Debug)]
+    enum Advance {
+        Ignored,
+        Applied(Vec<BlockchainEvent>),
+    }
+
+    /// Mirrors `advance_block_pool`'s loop without the network: `parents` stands in for
+    /// `getblock` on a parent hash, `node_best` for `getblockhash` on bitcoind's best chain, and
+    /// `store` for the in-memory block store. `stale_check` toggles the INFRA-685 guard so a test
+    /// can show the behaviour before it.
+    fn advance(
+        pool: &mut BlockPool,
+        incoming: BlockHeader,
+        parents: &HashMap<BlockIdentifier, BlockHeader>,
+        node_best: &HashMap<u64, String>,
+        reorg_window: u64,
+        stale_check: bool,
+        ctx: &Context,
+    ) -> Result<Advance, String> {
+        let mut store: HashMap<BlockIdentifier, BlockHeader> = HashMap::new();
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_front(incoming.block_identifier.clone());
+        store.insert(incoming.block_identifier.clone(), incoming);
+        let mut depth = 0u64;
+        let mut events = vec![];
+        while let Some(block_id) = queue.pop_front() {
+            if stale_check && depth == 0 {
+                let pool_tip = pool.canonical_chain_tip().cloned();
+                if needs_best_chain_check(&block_id, pool_tip.as_ref()) {
+                    let node_hash = node_best.get(&block_id.index).cloned().ok_or("missing")?;
+                    if is_off_best_chain(&block_id, &node_hash) {
+                        store.remove(&block_id);
+                        assert!(
+                            store.is_empty(),
+                            "nothing else is held for an ignored block"
+                        );
+                        return Ok(Advance::Ignored);
+                    }
+                }
+            }
+            let header = store.get(&block_id).unwrap().clone();
+            if pool.can_process_header(&header) {
+                match pool.process_header(header.clone(), ctx)? {
+                    Some(event) => {
+                        match &event {
+                            BlockchainEvent::BlockchainUpdatedWithHeaders(e) => {
+                                for h in &e.new_headers {
+                                    store.remove(&h.block_identifier).unwrap();
+                                }
+                            }
+                            BlockchainEvent::BlockchainUpdatedWithReorg(e) => {
+                                for h in &e.headers_to_apply {
+                                    store.remove(&h.block_identifier).unwrap();
+                                }
+                            }
+                        }
+                        events.push(event);
+                    }
+                    // Same as `advance_block_pool`: recorded, canonical chain unchanged.
+                    None => {}
+                }
+                continue;
+            }
+            depth += 1;
+            check_parent_walk_bounds(depth, store.len(), reorg_window)?;
+            let parent = parents
+                .get(&header.parent_block_identifier)
+                .cloned()
+                .ok_or("unknown parent")?;
+            store.insert(parent.block_identifier.clone(), parent.clone());
+            queue.push_front(block_id);
+            queue.push_front(parent.block_identifier.clone());
+        }
+        Ok(Advance::Applied(events))
+    }
+
+    /// INFRA-685, the nj guest 203 crash loop: at tip 157450 the indexer is handed a stale testnet4
+    /// fork block at 157376. The node's best chain has another block there, so it is dropped: no
+    /// error, no parent walk, pool unchanged. Without the guard the same input exits the process.
+    #[test]
+    fn stale_fork_below_tip_is_ignored_without_error() {
+        let ctx = Context::empty();
+        let tip = 157_450u64;
+        let fork_at = 157_375u64;
+        let mut parents = HashMap::new();
+        let mut node_best = HashMap::new();
+        for h in 157_200..=tip {
+            parents.insert(id(0, h), header(0, h));
+            node_best.insert(h, hash(0, h));
+        }
+        let stale = fork_header(1, 157_376, fork_at);
+        parents.insert(stale.block_identifier.clone(), stale.clone());
+
+        let mut pool = primed_pool(tip, &ctx);
+        let outcome = advance(
+            &mut pool,
+            stale.clone(),
+            &parents,
+            &node_best,
+            100,
+            true,
+            &ctx,
+        )
+        .expect("a stale fork below the tip must not be an error");
+        assert!(matches!(outcome, Advance::Ignored), "got {outcome:?}");
+        assert_eq!(pool.canonical_chain_tip(), Some(&id(0, tip)));
+
+        // The pool still follows the canonical chain afterwards.
+        match advance(
+            &mut pool,
+            header(0, tip + 1),
+            &parents,
+            &node_best,
+            100,
+            true,
+            &ctx,
+        ) {
+            Ok(Advance::Applied(events)) => assert_eq!(events.len(), 1),
+            other => panic!("expected the next canonical block to apply, got {other:?}"),
+        }
+
+        // Before INFRA-685: the walk descends from 157375 and never meets the 7 primed headers.
+        let mut old_pool = primed_pool(tip, &ctx);
+        let err = advance(&mut old_pool, stale, &parents, &node_best, 100, false, &ctx)
+            .expect_err("the old behaviour exits");
+        assert!(err.contains("no common ancestor"), "{err}");
+    }
+
+    /// A stale block one below the tip still connects to a primed header. Without the guard it
+    /// forms an equal-length fork; with it the block is dropped and the pool tip stays put.
+    #[test]
+    fn stale_fork_with_known_parent_is_ignored() {
+        let ctx = Context::empty();
+        let tip = 1_000u64;
+        let mut node_best = HashMap::new();
+        for h in 900..=tip {
+            node_best.insert(h, hash(0, h));
+        }
+        let parents = HashMap::new();
+        let mut pool = primed_pool(tip, &ctx);
+        let stale = fork_header(1, tip - 1, tip - 2);
+        assert!(
+            pool.can_process_header(&stale),
+            "its parent is a primed header"
+        );
+        let outcome = advance(&mut pool, stale, &parents, &node_best, 100, true, &ctx).unwrap();
+        assert!(matches!(outcome, Advance::Ignored), "got {outcome:?}");
+        assert_eq!(pool.canonical_chain_tip(), Some(&id(0, tip)));
+    }
+
+    /// The guard asks the node, it does not assume: a block at or below our tip that bitcoind's best
+    /// chain does contain (a same-height reorg with more work) is still walked and applied.
+    #[test]
+    fn block_below_tip_on_the_node_best_chain_is_still_walked() {
+        let ctx = Context::empty();
+        let tip = 1_000u64;
+        let fork_at = 998u64;
+        let mut parents = HashMap::new();
+        let mut node_best = HashMap::new();
+        for h in 900..=tip {
+            parents.insert(id(0, h), header(0, h));
+            node_best.insert(h, hash(0, h));
+        }
+        for h in (fork_at + 1)..=tip {
+            let b = fork_header(1, h, fork_at);
+            parents.insert(b.block_identifier.clone(), b);
+            node_best.insert(h, hash(1, h));
+        }
+        let mut pool = primed_pool(tip, &ctx);
+        let outcome = advance(
+            &mut pool,
+            fork_header(1, tip, fork_at),
+            &parents,
+            &node_best,
+            100,
+            true,
+            &ctx,
+        )
+        .unwrap();
+        assert!(matches!(outcome, Advance::Applied(_)), "got {outcome:?}");
+    }
+
+    /// A genuine reorg deeper than the window still fails loudly (INFRA-389 is kept): the new tip is
+    /// above ours, so the INFRA-685 guard does not apply, and the walk stops at the bound.
+    #[test]
+    fn genuine_reorg_deeper_than_window_still_errors() {
+        let ctx = Context::empty();
+        let tip = 1_000u64;
+        let fork_at = 850u64;
+        let mut parents = HashMap::new();
+        let mut node_best = HashMap::new();
+        for h in 700..=tip {
+            parents.insert(id(0, h), header(0, h));
+        }
+        for h in 700..=fork_at {
+            node_best.insert(h, hash(0, h));
+        }
+        for h in (fork_at + 1)..=(tip + 1) {
+            let b = fork_header(1, h, fork_at);
+            parents.insert(b.block_identifier.clone(), b);
+            node_best.insert(h, hash(1, h));
+        }
+        let mut pool = primed_pool(tip, &ctx);
+        let err = advance(
+            &mut pool,
+            fork_header(1, tip + 1, fork_at),
+            &parents,
+            &node_best,
+            100,
+            true,
+            &ctx,
+        )
+        .expect_err("a 150-block reorg exceeds the 100-block window");
+        assert!(err.contains("reorg deeper than 100 blocks"), "{err}");
+        assert_eq!(pool.canonical_chain_tip(), Some(&id(0, tip)));
+    }
+
+    /// An ordinary 2-block reorg to a longer chain: ZMQ announces only the new tip (above ours), the
+    /// walk fetches its two parents, finds the common ancestor in the primed headers and reorgs.
+    #[test]
+    fn short_reorg_to_longer_chain_still_applies() {
+        let ctx = Context::empty();
+        let tip = 1_000u64;
+        let fork_at = 998u64;
+        let mut parents = HashMap::new();
+        let mut node_best = HashMap::new();
+        for h in 900..=tip {
+            parents.insert(id(0, h), header(0, h));
+        }
+        for h in 900..=fork_at {
+            node_best.insert(h, hash(0, h));
+        }
+        for h in (fork_at + 1)..=(tip + 1) {
+            let b = fork_header(1, h, fork_at);
+            parents.insert(b.block_identifier.clone(), b);
+            node_best.insert(h, hash(1, h));
+        }
+        let mut pool = primed_pool(tip, &ctx);
+        let events = match advance(
+            &mut pool,
+            fork_header(1, tip + 1, fork_at),
+            &parents,
+            &node_best,
+            100,
+            true,
+            &ctx,
+        ) {
+            Ok(Advance::Applied(events)) => events,
+            other => panic!("expected the reorg to apply, got {other:?}"),
+        };
+        assert_eq!(pool.canonical_chain_tip(), Some(&id(1, tip + 1)));
+        let rolled_back: Vec<BlockIdentifier> = events
+            .iter()
+            .filter_map(|e| match e {
+                BlockchainEvent::BlockchainUpdatedWithReorg(r) => Some(
+                    r.headers_to_rollback
+                        .iter()
+                        .map(|h| h.block_identifier.clone())
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(rolled_back.contains(&id(0, 999)), "{rolled_back:?}");
+        assert!(rolled_back.contains(&id(0, 1_000)), "{rolled_back:?}");
+    }
+
+    #[test]
+    fn best_chain_check_only_at_or_below_the_tip() {
+        let tip = id(0, 100);
+        assert!(needs_best_chain_check(&id(1, 100), Some(&tip)));
+        assert!(needs_best_chain_check(&id(1, 40), Some(&tip)));
+        assert!(!needs_best_chain_check(&id(1, 101), Some(&tip)));
+        assert!(!needs_best_chain_check(&id(1, 40), None));
+        assert!(!is_off_best_chain(&id(0, 40), &hash(0, 40)));
+        assert!(!is_off_best_chain(
+            &id(0, 40),
+            &format!("0x{}", hash(0, 40).to_uppercase())
+        ));
+        assert!(is_off_best_chain(&id(1, 40), &hash(0, 40)));
     }
 
     #[test]

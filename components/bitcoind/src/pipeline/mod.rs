@@ -13,7 +13,9 @@ use reqwest::Client;
 
 use crate::{
     block_pool::BlockPool,
-    reconcile::{check_parent_walk_bounds, is_unknown_hash},
+    reconcile::{
+        check_parent_walk_bounds, is_off_best_chain, is_unknown_hash, needs_best_chain_check,
+    },
     pipeline::{
         rpc::{
             download_and_parse_block_with_retry, pipeline::start_block_download_pipeline,
@@ -141,6 +143,35 @@ async fn advance_block_pool(
     }
 
     while let Some(block_id) = block_ids.pop_front() {
+        // INFRA-685: before anything else, check the block ZMQ (or the download pipeline) handed
+        // us. One at or below our tip that bitcoind's best chain does not contain is a stale fork
+        // behind us (testnet4 produces many). Walking its parents ends in the INFRA-389 bound and
+        // an exit once they are older than the headers the pool keeps; connecting it while its
+        // parent is still known would make it an equal-length fork the pool may switch to. Drop
+        // it. A block above our tip is not checked: a genuine reorg arrives that way and walks.
+        if parent_walk_depth == 0 {
+            let pool_tip = block_pool_ref.lock().unwrap().canonical_chain_tip().cloned();
+            if needs_best_chain_check(&block_id, pool_tip.as_ref()) {
+                let node_hash = retrieve_block_hash_with_retry(
+                    http_client,
+                    &block_id.index,
+                    &config.bitcoind,
+                    ctx,
+                )
+                .await?;
+                if is_off_best_chain(&block_id, &node_hash) {
+                    try_info!(
+                        ctx,
+                        "Ignoring stale fork block {} at or below the tip {}: bitcoind's best chain has 0x{} at that height",
+                        block_id,
+                        pool_tip.as_ref().map_or_else(String::new, |t| t.to_string()),
+                        node_hash.trim_start_matches("0x")
+                    );
+                    block_store_ref.lock().unwrap().remove(&block_id);
+                    continue;
+                }
+            }
+        }
         let (header, canonical) = {
             let mut pool_guard = block_pool_ref.lock().unwrap();
             let mut block_store_guard = block_store_ref.lock().unwrap();
@@ -193,7 +224,20 @@ async fn advance_block_pool(
                             (header, true)
                         }
                     },
-                    None => return Err("Unable to append block".into()),
+                    None => {
+                        // INFRA-685: the header was recorded but the canonical chain did not
+                        // change, e.g. a parent fetched by the walk below lands on a side branch
+                        // that is not longer yet. Its child, processed next, switches the chain.
+                        // This used to be a fatal "Unable to append block", so every reorg deeper
+                        // than one block (and a stale fork whose parent the pool still holds)
+                        // exited. The block stays in the store: a later reorg applies it from there.
+                        try_debug!(
+                            ctx,
+                            "Block {} recorded, canonical chain unchanged",
+                            header.block_identifier
+                        );
+                        (header, true)
+                    }
                 }
             } else {
                 try_info!(
