@@ -390,18 +390,32 @@ pub async fn get_inscribed_satpoints_at_tx_inputs<T: GenericClient>(
     Ok(results)
 }
 
+/// See [`get_inscribed_satpoints_at_outpoints`]. `OFFSET 0` is load-bearing: a
+/// bare `LATERAL` subquery is flattened into a plain join, which the planner
+/// may again turn into a hash/merge join over the whole table; the fence keeps
+/// it a per-outpoint parameterised probe.
+const OUTPOINT_PROBE_SQL: &str = "SELECT l.output, l.ordinal_number, l.\"offset\" \
+     FROM unnest($1::text[]) AS i(output) \
+     CROSS JOIN LATERAL ( \
+         SELECT output, ordinal_number, \"offset\" \
+         FROM current_locations WHERE output = i.output OFFSET 0 \
+     ) AS l";
+
 /// Bulk variant of [`get_inscribed_satpoints_at_tx_inputs`] keyed by outpoint
 /// rather than by per-tx vin. Used by the block-start prefetch path to load
 /// inscribed-satpoint state for every input referenced anywhere in the block
-/// in chunked round-trips, eliminating the per-transaction query that
+/// in one round-trip, eliminating the per-transaction query that
 /// dominates `augment_block_with_transfers` on busy blocks. See ADR-016.
 ///
-/// Uses the same `VALUES`-CTE join pattern as the legacy per-tx fn, chunked at
-/// 500 outpoints per query, because postgres picks a nested-loop-with-index-
-/// seek plan for small VALUES sets but falls back to a hash join over the
-/// whole `current_locations` table when given a multi-thousand-element
-/// `WHERE output = ANY($1)` array. The hash-join plan was the cause of the
-/// 2026-04-29 mainnet regression on block 825213.
+/// The outpoints go in as one `text[]` parameter and each is probed with a
+/// fenced `LATERAL` subquery, so the plan is fixed by the query's shape: a
+/// Nested Loop with one `current_locations_output_index` probe per outpoint
+/// whatever the array size or the `n_distinct` estimate. The earlier
+/// `VALUES`-CTE join and `WHERE output = ANY($1)` left the choice to the
+/// planner, which flipped to a hash join over the whole table on a low
+/// `n_distinct` sample (block 825213 on 2026-04-29, and again in INFRA-792),
+/// so no chunking is needed. Duplicate input outpoints yield duplicate rows,
+/// as the join did.
 pub async fn get_inscribed_satpoints_at_outpoints<T: GenericClient>(
     outpoints: &[String],
     client: &T,
@@ -410,34 +424,19 @@ pub async fn get_inscribed_satpoints_at_outpoints<T: GenericClient>(
     if outpoints.is_empty() {
         return Ok(results);
     }
-    for chunk in outpoints.chunks(500) {
-        let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(chunk.len());
-        for outpoint in chunk.iter() {
-            params.push(outpoint);
-        }
-        let rows = client
-            .query(
-                &format!(
-                    "WITH outpoints (output) AS (VALUES {}) \
-                     SELECT l.output, l.ordinal_number, l.\"offset\" \
-                     FROM current_locations AS l \
-                     INNER JOIN outpoints AS i ON i.output = l.output",
-                    utils::multi_row_query_param_str(chunk.len(), 1)
-                ),
-                &params,
-            )
-            .await
-            .map_err(|e| format!("get_inscribed_satpoints_at_outpoints: {e}"))?;
-        for row in rows.iter() {
-            let output: String = row.get("output");
-            let ordinal_number: PgNumericU64 = row.get("ordinal_number");
-            let offset: PgNumericU64 = row.get("offset");
-            let entry = results.entry(output).or_default();
-            entry.push(WatchedSatpoint {
-                ordinal_number: ordinal_number.0,
-                offset: offset.0,
-            });
-        }
+    let rows = client
+        .query(OUTPOINT_PROBE_SQL, &[&outpoints])
+        .await
+        .map_err(|e| format!("get_inscribed_satpoints_at_outpoints: {e}"))?;
+    for row in rows.iter() {
+        let output: String = row.get("output");
+        let ordinal_number: PgNumericU64 = row.get("ordinal_number");
+        let offset: PgNumericU64 = row.get("offset");
+        let entry = results.entry(output).or_default();
+        entry.push(WatchedSatpoint {
+            ordinal_number: ordinal_number.0,
+            offset: offset.0,
+        });
     }
     Ok(results)
 }
@@ -1684,6 +1683,49 @@ mod test {
                 // We don't have a previous block so it goes to none.
                 assert_eq!(None, get_chain_tip_block_height(&client).await?);
             }
+        }
+        pg_reset_db(&mut pg_client).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_inscribed_satpoints_at_outpoints() -> Result<(), String> {
+        let mut pg_client = pg_test_connection().await;
+        ordinals_pg::migrate(&mut pg_client).await?;
+        {
+            let mut ord_client = pg_pool_client(&pg_test_connection_pool()).await?;
+            let client = pg_begin(&mut ord_client).await?;
+            // Two sats on one outpoint, one on another, one outpoint without sats.
+            for (sat, output, offset) in [(1u64, "aa:0", 0u64), (2, "aa:0", 5), (3, "bb:1", 7)] {
+                client
+                    .execute(
+                        "INSERT INTO current_locations (ordinal_number, block_height, tx_id, tx_index, address, output, \"offset\")
+                         VALUES ($1, 1, 'x', 0, NULL, $2, $3)",
+                        &[&PgNumericU64(sat), &output, &PgNumericU64(offset)],
+                    )
+                    .await
+                    .unwrap();
+            }
+            let outpoints: Vec<String> = ["aa:0", "bb:1", "cc:2", "bb:1"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let found =
+                ordinals_pg::get_inscribed_satpoints_at_outpoints(&outpoints, &client).await?;
+            assert_eq!(2, found.len());
+            let mut aa: Vec<(u64, u64)> = found["aa:0"]
+                .iter()
+                .map(|w| (w.ordinal_number, w.offset))
+                .collect();
+            aa.sort();
+            assert_eq!(vec![(1, 0), (2, 5)], aa);
+            // A duplicated input outpoint yields its rows twice, as the old join did.
+            assert_eq!(2, found["bb:1"].len());
+            assert!(
+                ordinals_pg::get_inscribed_satpoints_at_outpoints(&[], &client)
+                    .await?
+                    .is_empty()
+            );
         }
         pg_reset_db(&mut pg_client).await?;
         Ok(())
