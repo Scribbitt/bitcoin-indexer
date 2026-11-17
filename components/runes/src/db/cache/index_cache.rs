@@ -339,7 +339,7 @@ impl IndexCache {
         try_info!(
             ctx,
             "Rejecting etching of already etched rune {rune}, tx {tx_id} @{height}",
-            tx_id = self.tx_cache.location.tx_id,
+            tx_id = &self.tx_cache.location.tx_id,
             height = self.tx_cache.location.block_height
         );
     }
