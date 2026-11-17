@@ -3,7 +3,7 @@ use std::{collections::HashMap, num::NonZeroUsize, str::FromStr};
 use bitcoin::{Network, ScriptBuf};
 use bitcoind::{
     bitcoincore_rpc::Client as BitcoinRpcClient,
-    try_debug, try_error, try_warn,
+    try_debug, try_error, try_info, try_warn,
     types::bitcoin::TxIn,
     utils::{bitcoind::bitcoind_get_client, Context},
 };
@@ -25,7 +25,7 @@ use crate::db::{
         db_balance_change::DbBalanceChange, db_ledger_entry::DbLedgerEntry,
         db_ledger_operation::DbLedgerOperation, db_rune::DbRune, db_supply_change::DbSupplyChange,
     },
-    pg_get_max_rune_number, pg_get_rune_by_id, pg_get_rune_total_mints,
+    pg_get_max_rune_number, pg_get_rune_by_id, pg_get_rune_total_mints, pg_rune_name_exists,
 };
 
 /// Holds rune data across multiple blocks for faster computations. Processes rune events as they happen during transactions and
@@ -183,7 +183,7 @@ impl IndexCache {
     pub async fn apply_etching(
         &mut self,
         etching: &Etching,
-        _db_tx: &mut Transaction<'_>,
+        db_tx: &mut Transaction<'_>,
         ctx: &Context,
         etchings_counter: &mut u64,
         bitcoin_tx: &bitcoin::Transaction,
@@ -210,8 +210,13 @@ impl IndexCache {
                 );
                 return Ok(());
             }
-            // Explicit non-reserved names require commit validation
+            // Explicit non-reserved names must be free and require commit validation
             Some(rune) => {
+                // A taken name makes this a runestone without an etching: no rune, no premine (ord: `RuneUpdater::etched`).
+                if self.rune_name_is_taken(&rune, db_tx, ctx).await {
+                    self.log_duplicate_etching(&rune, ctx);
+                    return Ok(());
+                }
                 if !rune_etching_has_valid_commit(
                     &self.bitcoin_client,
                     ctx,
@@ -249,7 +254,7 @@ impl IndexCache {
     pub async fn apply_cenotaph_etching(
         &mut self,
         rune: &Rune,
-        _db_tx: &mut Transaction<'_>,
+        db_tx: &mut Transaction<'_>,
         ctx: &Context,
         cenotaph_etchings_counter: &mut u64,
         bitcoin_tx: &bitcoin::Transaction,
@@ -274,6 +279,12 @@ impl IndexCache {
                 self.minimum_rune,
                 self.tx_cache.location.to_string()
             );
+            return Ok(());
+        }
+
+        // A name that is already etched is not etched again, cenotaph or not.
+        if self.rune_name_is_taken(rune, db_tx, ctx).await {
+            self.log_duplicate_etching(rune, ctx);
             return Ok(());
         }
 
@@ -308,6 +319,29 @@ impl IndexCache {
         self.next_rune_number += 1;
         *cenotaph_etchings_counter += 1;
         Ok(())
+    }
+
+    /// True if `rune`'s name is already etched: in this batch's unflushed rows (earlier transactions of this block included) or in
+    /// the DB. Same rule as ord's `rune_to_id` lookup in `RuneUpdater::etched`.
+    async fn rune_name_is_taken(
+        &self,
+        rune: &Rune,
+        db_tx: &mut Transaction<'_>,
+        ctx: &Context,
+    ) -> bool {
+        let name = rune.to_string();
+        // shortcut: one indexed DB lookup per explicit-name etching, no name cache; add one if etching-heavy blocks get slow.
+        self.db_cache.runes.iter().any(|r| r.name == name)
+            || pg_rune_name_exists(&name, db_tx, ctx).await
+    }
+
+    fn log_duplicate_etching(&self, rune: &Rune, ctx: &Context) {
+        try_info!(
+            ctx,
+            "Rejecting etching of already etched rune {rune}, tx {tx_id} @{height}",
+            tx_id = &self.tx_cache.location.tx_id,
+            height = self.tx_cache.location.block_height
+        );
     }
 
     pub async fn apply_mint(
@@ -571,6 +605,7 @@ mod tests {
     use postgres::{pg_begin, pg_pool, pg_pool_client};
 
     use super::*;
+    use crate::db::{pg_test_client, pg_test_config, pg_test_roll_back_migrations};
 
     #[tokio::test]
     async fn apply_etching_skips_with_early_returns() {
@@ -610,7 +645,8 @@ mod tests {
 
         let start_n = index.next_rune_number;
 
-        // Deadpool transaction to satisfy signature (won't be used due to early returns)
+        // The name lookup reads `runes`, so the schema must exist.
+        let mut pg_client = pg_test_client(true, &ctx).await;
         let pool = pg_pool(&PgDatabaseConfig {
             dbname: "postgres".to_string(),
             host: "localhost".to_string(),
@@ -686,5 +722,181 @@ mod tests {
             .await;
         assert!(res_below.is_ok());
         assert_eq!(index.next_rune_number, start_n);
+
+        let _ = db_tx.rollback().await;
+        drop(client);
+        pg_test_roll_back_migrations(&mut pg_client, &ctx).await;
+    }
+
+    fn test_index_cache(ctx: &Context, height: u64) -> IndexCache {
+        let network = bitcoin::Network::Bitcoin;
+        let cap = std::num::NonZeroUsize::new(1).unwrap();
+        IndexCache {
+            network,
+            next_rune_number: 1,
+            rune_cache: lru::LruCache::new(cap),
+            rune_total_mints_cache: lru::LruCache::new(cap),
+            output_cache: lru::LruCache::new(cap),
+            block_output_cache: HashMap::new(),
+            tx_cache: test_tx_cache(height, 0, "ab"),
+            db_cache: DbCache::new(),
+            bitcoin_client: bitcoind::utils::bitcoind::bitcoind_get_client(
+                &Config::test_default().bitcoind,
+                ctx,
+            ),
+            bitcoin_client_config: Config::test_default().bitcoind,
+            minimum_rune: Rune::minimum_at_height(network, Height(height as u32)),
+        }
+    }
+
+    fn test_tx_cache(height: u64, tx_index: u32, tx_id: &str) -> TransactionCache {
+        TransactionCache::new(
+            TransactionLocation {
+                network: bitcoin::Network::Bitcoin,
+                block_hash: format!("0x{}", "00".repeat(32)),
+                block_height: height,
+                timestamp: 0,
+                tx_index,
+                tx_id: format!("0x{tx_id}"),
+            },
+            HashMap::new(),
+            HashMap::new(),
+            None,
+            0,
+        )
+    }
+
+    /// Block 840989 on mainnet carries copies of names etched a few blocks earlier (e.g. PUNKEIGHTTWOTHREEFOUR, first etched at
+    /// 840988:534). A copy is not an etching: it must leave no rune, ledger, supply or balance rows behind.
+    #[tokio::test]
+    async fn duplicate_name_etching_writes_nothing() {
+        let ctx = Context::empty();
+        let mut index = test_index_cache(&ctx, 840_989);
+        let name: Rune = "PUNKEIGHTTWOTHREEFOUR".parse().unwrap();
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![],
+        };
+        let etching = Etching {
+            rune: Some(name),
+            premine: Some(1_000),
+            ..Default::default()
+        };
+
+        // The first etching, earlier in the same batch, is still unflushed.
+        let first = test_tx_cache(840_988, 534, "01").location.clone();
+        index
+            .db_cache
+            .runes
+            .push(DbRune::from_etching(&etching, 0, &first));
+        index.next_rune_number = 1;
+
+        // Deadpool transaction to satisfy the signature; the in-batch check returns before it is used.
+        let pool = pg_pool(&PgDatabaseConfig {
+            dbname: "postgres".to_string(),
+            host: "localhost".to_string(),
+            port: 5432,
+            user: "postgres".to_string(),
+            password: Some("postgres".to_string()),
+            search_path: None,
+            pool_max_size: Some(1),
+        })
+        .expect("pool");
+        let mut client = pg_pool_client(&pool).await.expect("client");
+        let mut db_tx = pg_begin(&mut client).await.expect("tx");
+
+        index.tx_cache = test_tx_cache(840_989, 1151, "02");
+        let mut etchings = 0u64;
+        let mut inputs = 0u64;
+        index
+            .apply_etching(&etching, &mut db_tx, &ctx, &mut etchings, &tx, &mut inputs)
+            .await
+            .unwrap();
+        index.end_transaction(&mut db_tx, &ctx);
+
+        let mut cenotaph_etchings = 0u64;
+        index.tx_cache = test_tx_cache(840_989, 1152, "03");
+        index
+            .apply_cenotaph_etching(
+                &name,
+                &mut db_tx,
+                &ctx,
+                &mut cenotaph_etchings,
+                &tx,
+                &mut inputs,
+            )
+            .await
+            .unwrap();
+        index.end_transaction(&mut db_tx, &ctx);
+
+        assert_eq!(etchings, 0);
+        assert_eq!(cenotaph_etchings, 0);
+        assert_eq!(index.next_rune_number, 1);
+        assert_eq!(inputs, 0); // rejected before the commitment lookup
+        assert_eq!(index.db_cache.runes.len(), 1); // only the first etching
+        assert!(index.tx_cache.etching.is_none());
+        assert!(index.db_cache.ledger_entries.is_empty());
+        assert!(index.db_cache.supply_changes.is_empty());
+        assert!(index.db_cache.balance_increases.is_empty());
+        assert!(index.db_cache.balance_deductions.is_empty());
+    }
+
+    /// Same rule when the first etching was already flushed to the `runes` table.
+    #[tokio::test]
+    async fn duplicate_name_etching_of_flushed_rune_writes_nothing() {
+        let ctx = Context::empty();
+        let mut pg_client = pg_test_client(true, &ctx).await;
+        let name: Rune = "PUNKSEVENFIVEZEROONE".parse().unwrap();
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![],
+        };
+        let etching = Etching {
+            rune: Some(name),
+            premine: Some(1_000),
+            ..Default::default()
+        };
+        let pool = pg_pool(&pg_test_config()).expect("pool");
+        let mut client = pg_pool_client(&pool).await.expect("client");
+        let mut db_tx = pg_begin(&mut client).await.expect("tx");
+
+        let mut index = test_index_cache(&ctx, 840_989);
+        let first = test_tx_cache(840_985, 2998, "01").location.clone();
+        index
+            .db_cache
+            .runes
+            .push(DbRune::from_etching(&etching, 0, &first));
+        index.db_cache.flush(&mut db_tx, &ctx).await;
+        assert!(index.db_cache.runes.is_empty());
+
+        index.tx_cache = test_tx_cache(840_989, 1151, "02");
+        let mut etchings = 0u64;
+        let mut inputs = 0u64;
+        index
+            .apply_etching(&etching, &mut db_tx, &ctx, &mut etchings, &tx, &mut inputs)
+            .await
+            .unwrap();
+        index.end_transaction(&mut db_tx, &ctx);
+
+        let rows = db_tx
+            .query("SELECT 1 FROM runes WHERE name = $1", &[&name.to_string()])
+            .await
+            .unwrap()
+            .len();
+        let _ = db_tx.rollback().await;
+        drop(client);
+        pg_test_roll_back_migrations(&mut pg_client, &ctx).await;
+
+        assert_eq!(rows, 1);
+        assert_eq!(etchings, 0);
+        assert_eq!(inputs, 0);
+        assert!(index.db_cache.runes.is_empty());
+        assert!(index.db_cache.ledger_entries.is_empty());
+        assert!(index.db_cache.supply_changes.is_empty());
+        assert!(index.db_cache.balance_increases.is_empty());
     }
 }
