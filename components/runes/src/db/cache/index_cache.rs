@@ -645,7 +645,8 @@ mod tests {
 
         let start_n = index.next_rune_number;
 
-        // Deadpool transaction to satisfy signature (won't be used due to early returns)
+        // The name lookup reads `runes`, so the schema must exist.
+        let mut pg_client = pg_test_client(true, &ctx).await;
         let pool = pg_pool(&PgDatabaseConfig {
             dbname: "postgres".to_string(),
             host: "localhost".to_string(),
@@ -721,6 +722,10 @@ mod tests {
             .await;
         assert!(res_below.is_ok());
         assert_eq!(index.next_rune_number, start_n);
+
+        let _ = db_tx.rollback().await;
+        drop(client);
+        pg_test_roll_back_migrations(&mut pg_client, &ctx).await;
     }
 
     fn test_index_cache(ctx: &Context, height: u64) -> IndexCache {
