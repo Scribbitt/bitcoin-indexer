@@ -469,6 +469,20 @@ pub async fn pg_get_rune_by_id(
     Some(DbRune::from_pg_row(&row))
 }
 
+/// True if a rune with this name is already in the `runes` table.
+pub async fn pg_rune_name_exists(name: &str, db_tx: &mut Transaction<'_>, ctx: &Context) -> bool {
+    match db_tx
+        .query_opt("SELECT 1 FROM runes WHERE name = $1", &[&name])
+        .await
+    {
+        Ok(row) => row.is_some(),
+        Err(e) => {
+            try_error!(ctx, "error checking rune name: {}", e.to_string());
+            process::exit(1);
+        }
+    }
+}
+
 pub async fn pg_get_rune_total_mints(
     id: &RuneId,
     db_tx: &mut Transaction<'_>,
